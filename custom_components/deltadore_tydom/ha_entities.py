@@ -1636,7 +1636,7 @@ class HAEnergy(SensorEntity, HAEntity):
         # Note: _ha_device is set in async_added_to_hass (not in __init__)
         # to comply with Home Assistant best practices for disabled entities
         self._attr_unique_id = f"{self._device.device_id}_energy"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._registered_sensors = []
 
     async def async_added_to_hass(self) -> None:
@@ -1694,7 +1694,7 @@ class HACover(CoverEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_cover"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._registered_sensors = []
         # NOTE: supported_features is intentionally NOT computed here.
         # It is exposed as a dynamic property below so that OPEN/CLOSE/STOP/
@@ -2038,7 +2038,7 @@ class HASmoke(BinarySensorEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_smoke"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._state = False
         self._registered_sensors = []
         self._attr_device_class = BinarySensorDeviceClass.SMOKE
@@ -2123,7 +2123,7 @@ class HaClimate(ClimateEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_climate"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._enable_turn_on_off_backwards_compatibility = False
 
         self.dict_modes_ha_to_dd = {
@@ -2294,6 +2294,23 @@ class HaClimate(ClimateEntity, HAEntity):
         """Return the unit of temperature measurement for the system."""
         return UnitOfTemperature.CELSIUS
 
+    def _is_thermic_level_degenerate(self) -> bool:
+        """Return True when the thermicLevel enum is unusable (only STOP).
+
+        Zigbee Atlantic/Fujitsu reversible splits expose a degenerate
+        ``thermicLevel`` (enum ``['STOP']`` / ``['STOP','STOP']``) that always
+        reads STOP/None and never reflects the running mode. For those, the real
+        mode is carried by ``authorization``. X3D heaters keep a meaningful
+        thermicLevel (NORMAL/ECO/COMFORT/...) and are therefore not degenerate.
+        """
+        metadata = getattr(self._device, "_metadata", None)
+        if not metadata or "thermicLevel" not in metadata:
+            return False
+        enum_values = metadata["thermicLevel"].get("enum_values")
+        if not enum_values:
+            return False
+        return set(enum_values) <= {"STOP"}
+
     @property
     def hvac_mode(self) -> HVACMode:
         """Return the current operation (e.g. heat, cool, idle)."""
@@ -2306,15 +2323,30 @@ class HaClimate(ClimateEntity, HAEntity):
             authorization = getattr(self._device, "authorization", None)
             if authorization is not None and authorization in self.dict_modes_dd_to_ha:
                 thermic_level = getattr(self._device, "thermicLevel", None)
+                # Radiateurs X3D : thermicLevel porte l'état marche/arrêt réel
+                # (NORMAL/ECO/STOP...) et prime sur authorization → comportement
+                # historique conservé. On l'ignore uniquement lorsqu'il est
+                # dégénéré (enum = ['STOP'] ou ['STOP','STOP']), cas des splits
+                # Zigbee Atlantic/Fujitsu où thermicLevel vaut toujours STOP/None
+                # et ne reflète jamais le mode réel.
                 if (
-                    thermic_level is not None
+                    not self._is_thermic_level_degenerate()
+                    and thermic_level is not None
                     and thermic_level in self.dict_modes_dd_to_ha
                 ):
                     LOGGER.debug(
-                        "authorization = %s",
+                        "authorization (via thermicLevel) = %s",
                         self.dict_modes_dd_to_ha[thermic_level],
                     )
                     return self.dict_modes_dd_to_ha[thermic_level]
+                # Splits Zigbee Atlantic/Fujitsu : authorization porte le mode
+                # réel (COOLING/HEATING/AUTO/VENTILATING/DRYING/STOP). Sans ce
+                # repli, l'entité restait bloquée sur OFF alors que l'unité
+                # fonctionnait (thermicLevel dégénéré à STOP).
+                LOGGER.debug(
+                    "authorization = %s", self.dict_modes_dd_to_ha[authorization]
+                )
+                return self.dict_modes_dd_to_ha[authorization]
         if hasattr(self._device, "thermicLevel"):
             thermic_level = getattr(self._device, "thermicLevel", None)
             if thermic_level is not None and thermic_level in self.dict_modes_dd_to_ha:
@@ -2381,6 +2413,14 @@ class HaClimate(ClimateEntity, HAEntity):
                     setpoint = getattr(self._device, "setpoint", None)
                     if setpoint is not None:
                         return float(setpoint)
+        # Repli final : consigne générique `setpoint` (les splits Zigbee
+        # Atlantic/Fujitsu exposent authorization + setpoint sans hvacMode).
+        # Purement additif : ne s'active que si aucune branche ci-dessus n'a
+        # renvoyé de valeur (comportement historique = None dans ce cas).
+        if hasattr(self._device, "setpoint"):
+            setpoint = getattr(self._device, "setpoint", None)
+            if setpoint is not None:
+                return float(setpoint)
         return None
 
     async def async_set_hvac_mode(self, hvac_mode):
@@ -2459,7 +2499,7 @@ class HaOpeningBinarySensor(BinarySensorEntity, HAEntity):
         # registry matches the existing entry; only the reported state changes
         # from open/closed to on/off.
         self._attr_unique_id = f"{self._device.device_id}_cover"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._registered_sensors = []
         self._attr_device_class = self._opening_device_class
 
@@ -2560,7 +2600,7 @@ class HaWindow(CoverEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_cover"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._registered_sensors = []
 
     async def async_added_to_hass(self) -> None:
@@ -2632,7 +2672,7 @@ class HaDoor(CoverEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_cover"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._registered_sensors = []
 
     async def async_added_to_hass(self) -> None:
@@ -2701,7 +2741,7 @@ class HaGate(CoverEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_cover"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._registered_sensors = []
         if (
             self._device._metadata is not None
@@ -2812,7 +2852,7 @@ class HaGarage(CoverEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_cover"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._registered_sensors = []
         if (
             self._device._metadata is not None
@@ -2924,7 +2964,7 @@ class HaLight(LightEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_light"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._registered_sensors = []
         if self._device._metadata is not None and "level" in self._device._metadata:
             self._attr_color_mode = ColorMode.BRIGHTNESS
@@ -3050,7 +3090,7 @@ class HaAlarm(AlarmControlPanelEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_alarm"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._attr_code_format = CodeFormat.NUMBER
         self._attr_code_arm_required = True
         self._registered_sensors = []
@@ -3201,7 +3241,7 @@ class HaWeather(WeatherEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_weather"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._registered_sensors = []
         if (
             self._device._metadata is not None
@@ -3277,7 +3317,7 @@ class HaMoisture(BinarySensorEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_moisture"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._state = False
         self._registered_sensors = []
         self._attr_device_class = BinarySensorDeviceClass.MOISTURE
@@ -3328,7 +3368,7 @@ class HaThermo(SensorEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_thermos"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._state = False
         self._registered_sensors = ["outTemperature"]
         self._attr_device_class = SensorDeviceClass.TEMPERATURE
@@ -3383,7 +3423,7 @@ class HASensor(SensorEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_sensor"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
         self._registered_sensors = []
 
     async def async_added_to_hass(self) -> None:
@@ -4733,7 +4773,7 @@ class HAMoment(SwitchEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_moment"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
 
     async def async_added_to_hass(self) -> None:
         """Refresh on every device push (see HACover for the MRO rationale)."""
@@ -4805,7 +4845,7 @@ class HASwitch(SwitchEntity, HAEntity):
         self._device = device
         self._device._ha_device = self
         self._attr_unique_id = f"{self._device.device_id}_switch"
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
 
     async def async_added_to_hass(self) -> None:
         """Refresh on every device push (see HACover for the MRO rationale)."""
@@ -4931,7 +4971,7 @@ class HAGroup(ButtonEntity, HAEntity):
             translation_key=translation_key,
         )
         self.entity_description = entity_description
-        self._attr_name = self._device.device_name
+        self._attr_name = None  # None => hérite du nom de l'appareil (has_entity_name=True), évite le doublage
 
     async def async_added_to_hass(self) -> None:
         """Refresh on every device push (see HACover for the MRO rationale)."""
