@@ -17,6 +17,10 @@ from homeassistant.components.climate import (
     ClimateEntityFeature,
     HVACMode,
     PRESET_NONE,
+    FAN_AUTO,
+    FAN_LOW,
+    FAN_MEDIUM,
+    FAN_HIGH,
 )
 from homeassistant.const import (
     ATTR_TEMPERATURE,
@@ -2263,6 +2267,53 @@ class HaClimate(ClimateEntity, HAEntity):
         ):
             self._attr_max_temp = self._device._metadata["setpoint"]["max"]
 
+        # ── Ventilation / fan speed (splits réversibles Atlantic/Fujitsu) ──
+        # Ces splits Zigbee exposent deux attributs *inscriptibles* :
+        #   - speed        (numeric rw, min=1/max=3) : niveau de vitesse fixe ;
+        #   - speedString  (string  rw, enum ["AUTO"]) : mode automatique.
+        # On construit dynamiquement la liste des fan_modes à partir des
+        # métadonnées, en mappant les niveaux 1/2/3 sur des noms standard HA
+        # (low/medium/high) tout en conservant la valeur numérique à écrire.
+        # Purement additif : les radiateurs X3D (sans speed/speedString)
+        # n'obtiennent PAS la fonctionnalité → aucune régression.
+        self._attr_fan_modes = []
+        self._fan_mode_to_speed: dict[str, int] = {}
+        self._speed_to_fan_mode: dict[int, str] = {}
+        metadata = getattr(self._device, "_metadata", None)
+        speed_meta = metadata.get("speed") if metadata else None
+        speedstring_meta = metadata.get("speedString") if metadata else None
+
+        # Mode automatique (speedString = AUTO)
+        if (
+            speedstring_meta is not None
+            and "AUTO" in speedstring_meta.get("enum_values", [])
+            and self._is_metadata_writable("speedString")
+        ):
+            self._attr_fan_modes.append(FAN_AUTO)
+
+        # Niveaux fixes (speed = 1..3)
+        if speed_meta is not None and self._is_metadata_writable("speed"):
+            smin = int(speed_meta.get("min", 1))
+            smax = int(speed_meta.get("max", 3))
+            level_names = {1: FAN_LOW, 2: FAN_MEDIUM, 3: FAN_HIGH}
+            for level in range(smin, smax + 1):
+                name = level_names.get(level, str(level))
+                self._attr_fan_modes.append(name)
+                self._fan_mode_to_speed[name] = level
+                self._speed_to_fan_mode[level] = name
+
+        if self._attr_fan_modes:
+            self._attr_supported_features |= ClimateEntityFeature.FAN_MODE
+
+    def _is_metadata_writable(self, attribute_name: str) -> bool:
+        """Return True when an attribute is writable per its Tydom metadata."""
+        metadata = getattr(self._device, "_metadata", None)
+        if not metadata or attribute_name not in metadata:
+            # No metadata → assume writable (historic default elsewhere).
+            return True
+        permission = metadata[attribute_name].get("permission", "rw")
+        return "w" in permission.lower()
+
     async def async_added_to_hass(self) -> None:
         """Refresh on every device push (see HACover for the MRO rationale)."""
         await super().async_added_to_hass()
@@ -2468,6 +2519,35 @@ class HaClimate(ClimateEntity, HAEntity):
     async def async_set_temperature(self, **kwargs):
         """Set new target temperature."""
         await self._device.set_temperature(str(kwargs.get(ATTR_TEMPERATURE)))
+
+    @property
+    def fan_mode(self) -> str | None:
+        """Return the current fan/ventilation mode.
+
+        Splits Atlantic/Fujitsu : ``speedString == "AUTO"`` signale le mode
+        automatique ; sinon ``speed`` (1/2/3) porte le niveau fixe courant.
+        Retourne ``None`` si l'appareil n'expose pas la ventilation.
+        """
+        if not self._attr_fan_modes:
+            return None
+        speed_string = getattr(self._device, "speedString", None)
+        if speed_string is not None and str(speed_string).strip().upper() == "AUTO":
+            return FAN_AUTO if FAN_AUTO in self._attr_fan_modes else None
+        speed = getattr(self._device, "speed", None)
+        if speed is not None:
+            try:
+                level = int(float(speed))
+            except (TypeError, ValueError):
+                return None
+            return self._speed_to_fan_mode.get(level)
+        return None
+
+    async def async_set_fan_mode(self, fan_mode: str) -> None:
+        """Set new target fan/ventilation mode."""
+        if fan_mode == FAN_AUTO:
+            await self._device.set_fan_speed("AUTO")
+        elif fan_mode in self._fan_mode_to_speed:
+            await self._device.set_fan_speed(self._fan_mode_to_speed[fan_mode])
 
 
 class HaOpeningBinarySensor(BinarySensorEntity, HAEntity):
