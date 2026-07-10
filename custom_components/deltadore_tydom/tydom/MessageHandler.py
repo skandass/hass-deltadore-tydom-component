@@ -502,6 +502,19 @@ class MessageHandler:
                     device_metadata.get(uid),
                     data,
                 )
+            case "sensorSun":
+                # Solar/illuminance sensor: handled by the generic sensor
+                # path; lightPower is typed as irradiance in HASensor.
+                return TydomDevice(
+                    tydom_client,
+                    uid,
+                    device_id,
+                    name,
+                    last_usage,
+                    endpoint,
+                    device_metadata.get(uid),
+                    data,
+                )
             case _:
                 LOGGER.info(
                     "Unknown usage : %s for device_id %s, uid %s - creating generic sensor",
