@@ -5747,8 +5747,27 @@ class HAGroupEntity(HAEntity):
         self.hass = hass
         self._device = device
         self._device._ha_device = self
+        self._owner_tydom_client = getattr(device, "_tydom_client", None)
         self._member_callbacks: dict[int, TydomDevice] = {}
         self._attr_name = None
+
+    def _get_hub(self):
+        """Resolve the owning hub for this native group entity."""
+        if self.hass is None:
+            return None
+        hubs = None
+        if hasattr(self.hass, "data") and DOMAIN in self.hass.data:
+            hubs = self.hass.data[DOMAIN]
+        if hubs:
+            if self._owner_tydom_client is not None:
+                for hub in hubs.values():
+                    if getattr(hub, "_tydom_client", None) is self._owner_tydom_client:
+                        return hub
+        # Unit tests and some stubs expose a direct `hass.hub` attribute.
+        direct_hub = getattr(self.hass, "hub", None)
+        if direct_hub is not None:
+            return direct_hub
+        return super()._get_hub()
 
     async def async_added_to_hass(self) -> None:
         """Subscribe to state updates from every current group member."""

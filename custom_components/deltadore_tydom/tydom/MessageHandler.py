@@ -541,6 +541,10 @@ class MessageHandler:
                 # body while the updated state arrives in a separate push. This
                 # also happens for requests using the gateway's reserved
                 # transaction id "0", which are not tracked as pending replies.
+                # Complete tracked requests immediately on empty ACK to avoid
+                # waiting for the full client timeout.
+                if transaction_id:
+                    self._complete_empty_cdata_reply(transaction_id)
                 # A ping is itself completed by this empty 200 response, so it
                 # must still reach the liveness bookkeeping even though there is
                 # no body to parse.
