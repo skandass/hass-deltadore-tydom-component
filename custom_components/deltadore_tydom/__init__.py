@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import homeassistant.helpers.config_validation as cv
 from homeassistant.const import CONF_HOST, CONF_MAC, CONF_PIN, Platform
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.device_registry import DeviceEntry
 
 from . import hub
 from .const import (
@@ -18,6 +21,7 @@ from .const import (
     CONF_REFRESH_INTERVAL,
     LOGGER,
 )
+from .device_removal import can_remove_device
 
 # Config schema for hassfest validation
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -300,11 +304,19 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     return True
 
 
+async def _teardown_hub(
+    hass: HomeAssistant, entry: ConfigEntry, tydom_hub: hub.Hub
+) -> None:
+    """Stop the hub and remove it from hass.data when it is still registered."""
+    await tydom_hub.async_shutdown()
+    if hass.data.get(DOMAIN, {}).get(entry.entry_id) is tydom_hub:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Delta Dore Tydom from a config entry."""
 
     entry.async_on_unload(entry.add_update_listener(update_listener))
-
     # Store an instance of the "connecting" class that does the work of speaking
     # with your actual devices.
     zone_home = entry.data.get(CONF_ZONES_HOME) or ""
@@ -316,6 +328,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     refresh_interval = "30"
     if CONF_REFRESH_INTERVAL in entry.data:
         refresh_interval = entry.data[CONF_REFRESH_INTERVAL]
+
+    existing_hub = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if existing_hub is not None:
+        await existing_hub.async_shutdown()
 
     tydom_hub = hub.Hub(
         hass,
@@ -350,8 +366,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.async_create_background_task(
             target=tydom_hub.refresh_data(), hass=hass, name="Tydom refresh data"
         )
+        entry.async_create_background_task(
+            target=tydom_hub.refresh_cdata(),
+            hass=hass,
+            name="Tydom refresh cdata",
+        )
 
+    except asyncio.CancelledError:
+        await _teardown_hub(hass, entry, tydom_hub)
+        raise
     except Exception as err:
+        await _teardown_hub(hass, entry, tydom_hub)
         raise ConfigEntryNotReady from err
 
     # This creates each HA object for each platform your device requires.
@@ -365,11 +390,41 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # This is called when an entry/configured device is to be removed. The class
     # needs to unload itself, and remove callbacks. See the classes for further
     # details
+    tydom_hub = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if tydom_hub is not None:
+        await tydom_hub.async_shutdown()
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id)
 
     return unload_ok
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    device_entry: DeviceEntry,
+) -> bool:
+    """Allow the user to remove a device owned by this TYDOM config entry."""
+    can_remove = can_remove_device(
+        device_entry,
+        config_entry.entry_id,
+    )
+
+    if can_remove:
+        LOGGER.info(
+            "Allowing user-requested removal of TYDOM device registry entry %s; "
+            "it may be rediscovered if the gateway still advertises it",
+            device_entry.id,
+        )
+    else:
+        LOGGER.warning(
+            "Refusing removal of device registry entry %s because it is not "
+            "owned by this TYDOM config entry",
+            device_entry.id,
+        )
+
+    return can_remove
 
 
 async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
