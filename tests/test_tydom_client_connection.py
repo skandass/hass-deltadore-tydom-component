@@ -1,12 +1,13 @@
 """Tests for serialised Tydom websocket connection ownership."""
 
 import asyncio
+from contextlib import asynccontextmanager
 import importlib.util
 from pathlib import Path
 import sys
 import types
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 _MISSING = object()
 _original_modules: dict[str, object] = {}
@@ -28,6 +29,15 @@ class _ClientConnectionError(Exception):
 
 class _WebSocketResponse:
     """Stand-in used only to evaluate runtime annotations."""
+
+
+class _AlarmCommandError(Exception):
+    """Stand-in retaining the command result inspected by the tests."""
+
+    def __init__(self, command: str, result: str) -> None:
+        """Store the simulated command result."""
+        self.command = command
+        self.result = result
 
 
 for package_name in (
@@ -80,6 +90,10 @@ _module(
     "custom_components.deltadore_tydom.tydom.MessageHandler",
     MessageHandler=MagicMock(),
 )
+_module(
+    "custom_components.deltadore_tydom.tydom.tydom_devices",
+    TydomAlarmCommandError=_AlarmCommandError,
+)
 
 module_name = "custom_components.deltadore_tydom.tydom.tydom_client"
 client_path = (
@@ -99,6 +113,7 @@ TydomClient = client_module.TydomClient
 TydomClientApiClientCommunicationError = (
     client_module.TydomClientApiClientCommunicationError
 )
+TydomAlarmCommandError = client_module.TydomAlarmCommandError
 sanitize_log_message = client_module.sanitize_log_message
 
 for name, original in _original_modules.items():
@@ -119,6 +134,91 @@ def _websocket() -> MagicMock:
     connection.close = AsyncMock(side_effect=close)
     connection.send_bytes = AsyncMock()
     return connection
+
+
+@asynccontextmanager
+async def _no_timeout(_duration):
+    """Provide a real async timeout context for isolated pairing tests."""
+    yield
+
+
+class TestLocalPasswordPairing(IsolatedAsyncioTestCase):
+    """Exercise the parser used by explicit physical-button pairing."""
+
+    def test_extracts_password_from_chunked_gateway_response(self) -> None:
+        """The local-password response may use TYDOM HTTP chunk framing."""
+        payload = b'{"current":"local-secret"}'
+        frame = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Uri-Origin: /configs/gateway/password\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+            + f"{len(payload):X}\r\n".encode()
+            + payload
+            + b"\r\n0\r\n\r\n"
+        )
+
+        assert TydomClient._extract_local_gateway_password(frame) == "local-secret"
+
+    def test_ignores_unrelated_gateway_event(self) -> None:
+        """Unsolicited state events must not be mistaken for credentials."""
+        frame = (
+            b"PUT /devices/data HTTP/1.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 26\r\n\r\n"
+            b'{"current":"not-a-password"}'
+        )
+
+        assert TydomClient._extract_local_gateway_password(frame) is None
+
+    def test_rejects_incomplete_chunked_response(self) -> None:
+        """A fragmented response is retained for a later websocket message."""
+        frame = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Uri-Origin: /configs/gateway/password\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+            b'1A\r\n{"current":"local-secret"}'
+        )
+
+        assert TydomClient._extract_local_gateway_password(frame) is None
+
+    async def test_reads_password_only_from_button_gated_socket(self) -> None:
+        """Pairing opens one unauthenticated socket and closes it afterwards."""
+        payload = b'{"current":"local-secret"}'
+        frame = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Uri-Origin: /configs/gateway/password\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload
+        )
+        connection = _websocket()
+        connection.receive = AsyncMock(
+            return_value=MagicMock(type=client_module.WSMsgType.BINARY, data=frame)
+        )
+        session = MagicMock()
+        session.ws_connect = AsyncMock(return_value=connection)
+
+        with (
+            patch.object(
+                client_module,
+                "async_create_clientsession",
+                return_value=session,
+            ),
+            patch.object(client_module.async_timeout, "timeout", _no_timeout),
+        ):
+            password = await TydomClient.async_read_local_gateway_password(
+                None, "local", "001122334455"
+            )
+
+        assert password == "local-secret"
+        assert "Authorization" not in session.ws_connect.await_args.kwargs["headers"]
+        connection.send_bytes.assert_awaited_once_with(
+            b"GET /configs/gateway/password HTTP/1.1\r\n"
+            b"Content-Length: 0\r\n"
+            b"Content-Type: application/json; charset=UTF-8\r\n"
+            b"Transac-Id: 0\r\n\r\n"
+        )
+        connection.close.assert_awaited_once()
 
 
 class TestManagedConnection(IsolatedAsyncioTestCase):
@@ -150,6 +250,106 @@ class TestManagedConnection(IsolatedAsyncioTestCase):
             True,
         )
 
+    async def test_set_local_gateway_password_uses_gateway_endpoint(self) -> None:
+        """The local password update uses the generic gateway endpoint."""
+        client = self._client()
+        client.get_reply_to_request = AsyncMock(return_value=[])
+
+        await client.async_set_local_gateway_password("NewPassword1")
+
+        client.get_reply_to_request.assert_awaited_once_with(
+            "PUT",
+            "/configs/gateway/password",
+            body={"password": "NewPassword1"},
+        )
+        self.assertEqual(client._password, "NewPassword1")
+
+    async def test_set_local_gateway_password_keeps_previous_password_on_failure(
+        self,
+    ) -> None:
+        """A rejected update must not poison the next Digest authentication."""
+        client = self._client()
+        client.get_reply_to_request = AsyncMock(
+            side_effect=TydomClientApiClientCommunicationError("rejected")
+        )
+
+        with self.assertRaises(TydomClientApiClientCommunicationError):
+            await client.async_set_local_gateway_password("NewPassword1")
+
+        self.assertEqual(client._password, "password")
+
+    async def test_delete_device_uses_parent_device_route(self) -> None:
+        """Permanent removal deletes the complete product rather than one endpoint."""
+        client = self._client()
+        client.get_reply_to_request = AsyncMock(return_value=[])
+
+        await client.delete_device("device/1")
+
+        client.get_reply_to_request.assert_awaited_once_with(
+            "DELETE", "/devices/device%2F1"
+        )
+
+    async def test_delete_group_uses_group_route(self) -> None:
+        """Related-endpoints groups use their dedicated group resource."""
+        client = self._client()
+        client.get_reply_to_request = AsyncMock(return_value=[])
+
+        await client.delete_group("group/1")
+
+        client.get_reply_to_request.assert_awaited_once_with(
+            "DELETE", "/groups/group%2F1"
+        )
+
+    async def test_file_document_requests_preserve_the_complete_json(self) -> None:
+        """Dedicated-group removal reads and writes complete gateway files."""
+        client = self._client()
+        config = {"endpoints": [], "groups": []}
+        groups = {"groups": []}
+        client.get_reply_to_request = AsyncMock(
+            side_effect=[[[config]], [[groups]], [], []]
+        )
+
+        self.assertEqual(await client.get_config_file_document(), config)
+        self.assertEqual(await client.get_groups_file_document(), groups)
+        await client.post_config_file_document(config)
+        await client.post_groups_file_document(groups)
+
+        self.assertEqual(
+            client.get_reply_to_request.await_args_list,
+            [
+                call("GET", "/configs/file"),
+                call("GET", "/groups/file"),
+                call("POST", "/configs/file", body=config),
+                call("POST", "/groups/file", body=groups),
+            ],
+        )
+
+    async def test_delete_endpoint_keeps_the_channel_specific_route(self) -> None:
+        """Endpoint removal remains distinct from complete product removal."""
+        client = self._client()
+        client.get_reply_to_request = AsyncMock(return_value=[])
+
+        await client.delete_endpoint("device/1", "endpoint 2")
+
+        client.get_reply_to_request.assert_awaited_once_with(
+            "DELETE", "/devices/device%2F1/endpoints/endpoint%202"
+        )
+
+    async def test_set_local_gateway_password_rejects_cloud_mediation(self) -> None:
+        """The password-changing API must remain a direct local operation."""
+        client = TydomClient(
+            None,
+            "test",
+            "001122334455",
+            "password",
+            host="mediation.tydom.com",
+        )
+
+        with self.assertRaisesRegex(
+            client_module.TydomClientApiClientError, "direct local connection"
+        ):
+            await client.async_set_local_gateway_password("NewPassword1")
+
     async def test_legacy_alarm_zone_commands_are_still_split(self) -> None:
         """Legacy arm commands must continue to address each configured part."""
         client = self._client()
@@ -171,6 +371,57 @@ class TestManagedConnection(IsolatedAsyncioTestCase):
                 call("20", "10", "123456", "ON", "3", True),
             ],
         )
+
+    async def test_alarm_command_waits_for_acknowledged_result(self) -> None:
+        """Alarm commands must correlate their Transac-Id 0 cdata result."""
+        client = self._client()
+        waiter = asyncio.get_running_loop().create_future()
+        waiter.set_result(
+            {"name": "alarmCmd", "values": {"result": "ACK", "authent": "USER"}}
+        )
+        client._message_handler.create_alarm_command_waiter.return_value = waiter
+        client.send_bytes = AsyncMock()
+
+        confirmed = await client._put_alarm_cdata("20", "10", "123456", "ON")
+
+        self.assertTrue(confirmed)
+
+        request = client.send_bytes.await_args.args[0].decode("ascii")
+        self.assertIn("PUT /devices/20/endpoints/10/cdata?name=alarmCmd", request)
+        self.assertIn("Transac-Id: 0", request)
+        self.assertIn('{"value": "ON", "pwd": "123456"}', request)
+
+    async def test_silent_alarm_command_reports_unconfirmed_result(self) -> None:
+        """A gateway without a command outcome must not look like an ACK."""
+        client = self._client()
+        waiter = asyncio.get_running_loop().create_future()
+        waiter.set_exception(TimeoutError())
+        client._message_handler.create_alarm_command_waiter.return_value = waiter
+        client.send_bytes = AsyncMock()
+
+        confirmed = await client._put_alarm_cdata("20", "10", "123456", "ON")
+
+        self.assertFalse(confirmed)
+
+    async def test_denied_zone_alarm_command_raises(self) -> None:
+        """A gateway DENIED result must reach the Home Assistant action."""
+        client = self._client()
+        waiter = asyncio.get_running_loop().create_future()
+        waiter.set_result(
+            {"name": "zoneCmd", "values": {"result": "DENIED", "authent": "USER"}}
+        )
+        client._message_handler.create_alarm_command_waiter.return_value = waiter
+        client.send_bytes = AsyncMock()
+
+        with self.assertRaises(TydomAlarmCommandError) as context:
+            await client._put_alarm_cdata("20", "10", "123456", "ON", "1,3")
+
+        self.assertEqual(context.exception.command, "zoneCmd")
+        self.assertEqual(context.exception.result, "DENIED")
+        request = client.send_bytes.await_args.args[0].decode("ascii")
+        self.assertIn("PUT /devices/20/endpoints/10/cdata?name=zoneCmd", request)
+        self.assertIn("Transac-Id: 0", request)
+        self.assertIn('"zones": [1, 3]', request)
 
     async def test_alarm_inventory_uses_supported_label_command(self) -> None:
         """Inventory must not depend on optional unsupported productInfo data."""
@@ -196,6 +447,72 @@ class TestManagedConnection(IsolatedAsyncioTestCase):
                 ),
             ],
         )
+
+    async def test_product_discovery_tolerates_a_gateway_scan_timeout(self) -> None:
+        """Discovery must not fail when a gateway keeps its radio scan open."""
+        client = self._client()
+        client.get_reply_to_request = AsyncMock(
+            side_effect=TydomClientApiClientCommunicationError(
+                "Timeout waiting for reply to POST /devices/install"
+            )
+        )
+
+        await client.post_device_discovery(
+            {"protocol": "X3D", "type": "x3d_rm", "profile": "light"}
+        )
+
+        client.get_reply_to_request.assert_awaited_once_with(
+            "POST",
+            "/devices/install",
+            body={"protocol": "X3D", "type": "x3d_rm", "profile": "light"},
+            timeout=1,
+            log_timeout=False,
+        )
+
+    async def test_product_discovery_falls_back_when_install_is_not_supported(
+        self,
+    ) -> None:
+        """A gateway uses the compatibility action only after install returns 404."""
+        client = self._client()
+        client.get_reply_to_request = AsyncMock(
+            side_effect=TydomClientApiClientCommunicationError(
+                "Request POST /devices/install failed: HTTP 404"
+            )
+        )
+        client.send_request = AsyncMock(return_value="compatibility-request")
+        payload = {"protocol": "X3D", "type": "direct", "profile": "meter"}
+
+        await client.post_device_discovery(payload)
+
+        client.send_request.assert_awaited_once_with(
+            "POST", "/devices", body=payload
+        )
+        self.assertEqual(client._device_discovery_endpoint, "/devices")
+
+    async def test_product_discovery_remembers_the_compatibility_action(self) -> None:
+        """Once unsupported, do not probe the official route again this session."""
+        client = self._client()
+        client._device_discovery_endpoint = "/devices"
+        client.get_reply_to_request = AsyncMock()
+        client.send_request = AsyncMock(return_value="compatibility-request")
+        payload = {"protocol": "X3D", "type": "direct", "profile": "meter"}
+
+        await client.post_device_discovery(payload)
+
+        client.get_reply_to_request.assert_not_awaited()
+        client.send_request.assert_awaited_once_with("POST", "/devices", body=payload)
+
+    async def test_missing_optional_endpoints_are_not_retried(self) -> None:
+        """A legacy gateway's 404 capabilities are remembered per session."""
+        client = self._client()
+        client.send_message = AsyncMock()
+        client.mark_optional_path_unsupported("/scenarios/file")
+        client.mark_optional_path_unsupported("/moments/file")
+
+        await client.get_scenarii()
+        await client.get_moments()
+
+        client.send_message.assert_not_awaited()
 
     async def test_rejected_tracked_request_raises_protocol_error(self) -> None:
         """A gateway rejection must not be returned as an empty success."""
@@ -295,33 +612,32 @@ class TestManagedConnection(IsolatedAsyncioTestCase):
         )
 
     async def test_alarm_acknowledgement_prefers_authenticated_cdata(self) -> None:
-        """A configured code must use the controlled command advertised by TYXAL."""
+        """A configured code uses the asynchronous TYXAL command result."""
         client = self._client()
-        client.get_reply_to_request = AsyncMock(return_value=[])
+        waiter = asyncio.get_running_loop().create_future()
+        waiter.set_result({"name": "ackEventCmd", "values": {"result": "ACK"}})
+        client._message_handler.create_alarm_command_waiter.return_value = waiter
+        client.send_bytes = AsyncMock()
         client.put_devices_data = AsyncMock()
 
         await client.put_ackevents_cdata("20", "10", "123456")
 
-        client.get_reply_to_request.assert_awaited_once_with(
-            "PUT",
-            "/devices/20/endpoints/10/cdata?name=ackEventCmd",
-            body={"pwd": "123456"},
-        )
+        request = client.send_bytes.await_args.args[0].decode("ascii")
+        self.assertIn("PUT /devices/20/endpoints/10/cdata?name=ackEventCmd", request)
+        self.assertIn("Transac-Id: 0", request)
+        self.assertIn('{"pwd": "123456"}', request)
         client.put_devices_data.assert_not_awaited()
 
-    async def test_alarm_acknowledgement_falls_back_to_data_channel(self) -> None:
-        """Firmware rejecting authenticated cdata must retain the proven fallback."""
+    async def test_alarm_acknowledgement_rejects_denied_result(self) -> None:
+        """A negative asynchronous result must reach the service caller."""
         client = self._client()
-        client.get_reply_to_request = AsyncMock(
-            side_effect=TydomClientApiClientCommunicationError("HTTP 500")
-        )
-        client.put_devices_data = AsyncMock()
+        waiter = asyncio.get_running_loop().create_future()
+        waiter.set_result({"name": "ackEventCmd", "values": {"result": "DENIED"}})
+        client._message_handler.create_alarm_command_waiter.return_value = waiter
+        client.send_bytes = AsyncMock()
 
-        await client.put_ackevents_cdata("20", "10", "123456")
-
-        client.put_devices_data.assert_awaited_once_with(
-            "20", "10", "ackEventCmd", "ACK"
-        )
+        with self.assertRaises(TydomAlarmCommandError):
+            await client.put_ackevents_cdata("20", "10", "123456")
 
     async def test_alarm_remote_configuration_lock_uses_official_command(self) -> None:
         """Remote TYXAL configuration must be explicitly locked and unlocked."""
@@ -516,6 +832,30 @@ class TestManagedConnection(IsolatedAsyncioTestCase):
 
         client._reconnect_with_backoff.assert_awaited_once()
         replacement.send_bytes.assert_awaited_once_with(b"request")
+
+    async def test_area_attributes_are_sent_in_one_request(self) -> None:
+        """A TRV local override must be an atomic area-level command."""
+        client = self._client()
+        client.send_bytes = AsyncMock()
+
+        await client.put_area_data_attributes(
+            1761575990,
+            {
+                "localSetpoint": "20.5",
+                "localSetpRemainingTimeStr": "UNTIL_SCHED",
+                "localMode": "LOCAL_SETPOINT",
+            },
+        )
+
+        request = client.send_bytes.await_args.args[0].decode("ascii")
+        self.assertIn("PUT /areas/1761575990/data HTTP/1.1", request)
+        self.assertIn('"name": "localSetpoint", "value": "20.5"', request)
+        self.assertIn(
+            '"name": "localSetpRemainingTimeStr", "value": "UNTIL_SCHED"',
+            request,
+        )
+        self.assertIn('"name": "localMode", "value": "LOCAL_SETPOINT"', request)
+        client.send_bytes.assert_awaited_once()
 
 
 class TestDevicePolling(IsolatedAsyncioTestCase):
