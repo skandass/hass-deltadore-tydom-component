@@ -96,8 +96,8 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.components.button import ButtonEntity
 from homeassistant.components.number import NumberEntity
 from homeassistant.components.select import SelectEntity
+from homeassistant.components.text import TextEntity, TextMode
 from homeassistant.components.event import EventDeviceClass, EventEntity
-
 from .tydom.tydom_devices import (
     Tydom,
     TydomDevice,
@@ -120,6 +120,8 @@ from .tydom.tydom_devices import (
     TydomMoment,
     TydomRemoteControl,
     TydomInterrupter,
+    TydomAlarmCommandError,
+    TydomOpenIssuesNotReadyError,
     get_twc_scene_action,
 )
 
@@ -131,12 +133,19 @@ from .const import (
     get_naviclim_fan_modes,
 )
 from .tydom.MessageHandler import device_name, groups_data
+from .official_association_tutorials import get_association_illustration_data_url
+
+ASSOCIATION_GUIDE_EVENT = f"{DOMAIN}_association_guide"
 
 
 _BINARY_TRUE_VALUES = frozenset({"1", "on", "true", "yes"})
 _BINARY_FALSE_VALUES = frozenset({"0", "off", "false", "no"})
 _PROBLEM_ATTRIBUTE_MARKERS = ("defect", "empty", "intrusion")
 _BINARY_OPEN_STATES = frozenset({"LOCKED", "UNLOCKED"})
+_AUTOMATIC_ALARM_HISTORY_TIMEOUT = 10.0
+_REFUSED_ARMING_SETTLE_DELAY = 2.0
+_UNCONFIRMED_ARMING_SETTLE_DELAY = 6.0
+_OPEN_ISSUES_RETRY_DELAY = 2.0
 
 
 def normalize_binary_state(value: Any, *, allow_numeric: bool = False) -> bool | None:
@@ -229,6 +238,22 @@ def is_binary_attribute(
     )
 
 
+def _get_hub_for_tydom_device(hass: Any, device: Any):
+    """Return the hub that owns one device, even with several gateways."""
+    if hass is None:
+        return None
+    hubs = getattr(hass, "data", {}).get(DOMAIN, {})
+    device_client = getattr(device, "_tydom_client", None)
+    for hub in hubs.values():
+        if getattr(hub, "_tydom_client", None) is device_client:
+            return hub
+        if any(
+            candidate is device for candidate in getattr(hub, "devices", {}).values()
+        ):
+            return hub
+    return None
+
+
 class HAEntity:
     """Generic abstract HA entity."""
 
@@ -242,17 +267,8 @@ class HAEntity:
     hass: Any = None
 
     def _get_hub(self):
-        """Get the hub instance from hass data."""
-        if self.hass is None:
-            return None
-        if DOMAIN not in self.hass.data:
-            return None
-        # Get the first hub entry (assuming single hub per instance)
-        hubs = self.hass.data[DOMAIN]
-        if not hubs:
-            return None
-        # Return the first hub (entry_id is the key)
-        return next(iter(hubs.values()))
+        """Return the hub that owns this entity's TYDOM device."""
+        return _get_hub_for_tydom_device(self.hass, self._device)
 
     def _get_tydom_gateway_device_id(self) -> str | None:
         """Get the Tydom gateway device_id to use as via_device_id."""
@@ -272,7 +288,7 @@ class HAEntity:
         return None
 
     def _enrich_device_info(self, info: DeviceInfo) -> DeviceInfo:
-        """Enrich device info with via_device link to gateway.
+        """Enrich device info with a parent link to the gateway.
 
         Note: If area information becomes available from Tydom API
         (via /areas/data endpoint), we could add 'suggested_area' to DeviceInfo
@@ -283,7 +299,10 @@ class HAEntity:
         gateway_device_id = self._get_tydom_gateway_device_id()
         if gateway_device_id is not None and self._device is not None:
             if gateway_device_id != self._device.device_id:
-                info["via_device"] = (DOMAIN, gateway_device_id)
+                if gateway_registry_device_id := _get_tydom_gateway_registry_device_id(
+                    self.hass, self._device
+                ):
+                    info["via_device_id"] = gateway_registry_device_id
         return info
 
     async def async_added_to_hass(self) -> None:
@@ -474,6 +493,51 @@ class HAEntity:
         return info
 
 
+def _get_tydom_gateway_registry_device_id(hass: Any, device: Any) -> str | None:
+    """Resolve the owning gateway's Home Assistant device-registry ID.
+
+    Device identifiers are scoped to a config entry in Home Assistant 2026.9.
+    Resolving the parent through the owning hub therefore avoids linking a child
+    from one TYDOM gateway to an identically identified gateway from another
+    config entry.
+    """
+    hub = _get_hub_for_tydom_device(hass, device)
+    entry = getattr(hub, "_entry", None)
+    if hub is None or entry is None:
+        return None
+
+    gateway_device_id = next(
+        (
+            gateway.device_id
+            for gateway in getattr(hub, "devices", {}).values()
+            if isinstance(gateway, Tydom)
+        ),
+        None,
+    )
+    if gateway_device_id is None:
+        gateway_device_id = next(
+            (
+                ha_device._device.device_id
+                for ha_device in getattr(hub, "ha_devices", {}).values()
+                if isinstance(ha_device, HATydom)
+            ),
+            None,
+        )
+    if gateway_device_id is None:
+        return None
+
+    try:
+        return dr.async_get_device_id_by_identifier(
+            hass,
+            (DOMAIN, gateway_device_id),
+            config_entry_id=entry.entry_id,
+        )
+    except ValueError:
+        # The gateway entity has not been registered yet. Omitting the optional
+        # parent link is safer than creating a link to another config entry.
+        return None
+
+
 class GenericSensor(SensorEntity):
     """Representation of a generic sensor."""
 
@@ -545,15 +609,8 @@ class GenericSensor(SensorEntity):
             self._attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def _get_hub(self):
-        """Get the hub instance from hass data."""
-        if not hasattr(self, "hass") or self.hass is None:
-            return None
-        if DOMAIN not in self.hass.data:
-            return None
-        hubs = self.hass.data[DOMAIN]
-        if not hubs:
-            return None
-        return next(iter(hubs.values()))
+        """Return the hub that owns this entity's TYDOM device."""
+        return _get_hub_for_tydom_device(self.hass, self._device)
 
     def _get_tydom_gateway_device_id(self) -> str | None:
         """Get the Tydom gateway device_id to use as via_device_id."""
@@ -710,10 +767,13 @@ class GenericSensor(SensorEntity):
         if "sw_version" in device_info_dict and not grouped_with_parent:
             info["sw_version"] = device_info_dict["sw_version"]
 
-        # Link device to Tydom gateway via via_device
+        # Link device to the owning Tydom gateway.
         gateway_device_id = self._get_tydom_gateway_device_id()
         if gateway_device_id is not None and gateway_device_id != registry_device_id:
-            info["via_device"] = (DOMAIN, gateway_device_id)
+            if gateway_registry_device_id := _get_tydom_gateway_registry_device_id(
+                self.hass, self._device
+            ):
+                info["via_device_id"] = gateway_registry_device_id
 
         return info
 
@@ -779,15 +839,8 @@ class BinarySensorBase(BinarySensorEntity):
         self._device = device
 
     def _get_hub(self):
-        """Get the hub instance from hass data."""
-        if not hasattr(self, "hass") or self.hass is None:
-            return None
-        if DOMAIN not in self.hass.data:
-            return None
-        hubs = self.hass.data[DOMAIN]
-        if not hubs:
-            return None
-        return next(iter(hubs.values()))
+        """Return the hub that owns this entity's TYDOM device."""
+        return _get_hub_for_tydom_device(self.hass, self._device)
 
     def _get_tydom_gateway_device_id(self) -> str | None:
         """Get the Tydom gateway device_id to use as via_device_id."""
@@ -855,7 +908,10 @@ class BinarySensorBase(BinarySensorEntity):
         # Link to gateway if available
         gateway_device_id = self._get_tydom_gateway_device_id()
         if gateway_device_id is not None and gateway_device_id != registry_device_id:
-            info["via_device"] = (DOMAIN, gateway_device_id)
+            if gateway_registry_device_id := _get_tydom_gateway_registry_device_id(
+                self.hass, self._device
+            ):
+                info["via_device_id"] = gateway_registry_device_id
         return info
 
     async def async_added_to_hass(self):
@@ -918,15 +974,8 @@ class GenericBinarySensor(BinarySensorBase):
             self._attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def _get_hub(self):
-        """Get the hub instance from hass data."""
-        if not hasattr(self, "hass") or self.hass is None:
-            return None
-        if DOMAIN not in self.hass.data:
-            return None
-        hubs = self.hass.data[DOMAIN]
-        if not hubs:
-            return None
-        return next(iter(hubs.values()))
+        """Return the hub that owns this entity's TYDOM device."""
+        return _get_hub_for_tydom_device(self.hass, self._device)
 
     def _get_tydom_gateway_device_id(self) -> str | None:
         """Get the Tydom gateway device_id to use as via_device_id."""
@@ -1102,15 +1151,8 @@ class ClockSensor(SensorEntity):
         return attrs
 
     def _get_hub(self):
-        """Get the hub instance from hass data."""
-        if not hasattr(self, "hass") or self.hass is None:
-            return None
-        if DOMAIN not in self.hass.data:
-            return None
-        hubs = self.hass.data[DOMAIN]
-        if not hubs:
-            return None
-        return next(iter(hubs.values()))
+        """Return the hub that owns this entity's TYDOM device."""
+        return _get_hub_for_tydom_device(self.hass, self._device)
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -1223,15 +1265,8 @@ class GeolocationSensor(SensorEntity):
         return attrs
 
     def _get_hub(self):
-        """Get the hub instance from hass data."""
-        if not hasattr(self, "hass") or self.hass is None:
-            return None
-        if DOMAIN not in self.hass.data:
-            return None
-        hubs = self.hass.data[DOMAIN]
-        if not hubs:
-            return None
-        return next(iter(hubs.values()))
+        """Return the hub that owns this entity's TYDOM device."""
+        return _get_hub_for_tydom_device(self.hass, self._device)
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -2555,6 +2590,48 @@ class HaClimate(ClimateEntity, HAEntity):
         if self._supports_fan:
             self._attr_supported_features |= ClimateEntityFeature.FAN_MODE
 
+        if self._device.is_area_trv:
+            self._attr_hvac_modes = [HVACMode.HEAT]
+            self._attr_preset_modes = []
+            self._attr_fan_modes = []
+            self._supports_fan = False
+            self._attr_supported_features &= ~(
+                ClimateEntityFeature.TURN_OFF
+                | ClimateEntityFeature.TURN_ON
+                | ClimateEntityFeature.PRESET_MODE
+                | ClimateEntityFeature.FAN_MODE
+            )
+            # The reporter's physical TRV endpoints do not include
+            # localSetpoint metadata, but the linked area still accepts the
+            # local override command.
+            self._attr_supported_features |= ClimateEntityFeature.TARGET_TEMPERATURE
+
+    @property
+    def supported_features(self) -> ClimateEntityFeature:
+        """Return the features currently supported by this climate entity.
+
+        A TRV's physical endpoint and its area state can be discovered in either
+        order.  Derive its capabilities from the live device rather than only
+        from the state present while the Home Assistant entity was constructed.
+        """
+        features = self._attr_supported_features
+        if not self._device.is_area_trv:
+            return features
+
+        return (features | ClimateEntityFeature.TARGET_TEMPERATURE) & ~(
+            ClimateEntityFeature.TURN_OFF
+            | ClimateEntityFeature.TURN_ON
+            | ClimateEntityFeature.PRESET_MODE
+            | ClimateEntityFeature.FAN_MODE
+        )
+
+    @property
+    def hvac_modes(self) -> list[HVACMode]:
+        """Return the modes currently supported by this climate entity."""
+        if self._device.is_area_trv:
+            return [HVACMode.HEAT]
+        return self._attr_hvac_modes
+
     def get_sensors(self):
         """Avoid duplicating the source controller's sensors on area proxies."""
         if self._device.is_derived_area_climate:
@@ -2622,6 +2699,9 @@ class HaClimate(ClimateEntity, HAEntity):
 
     def _resolve_hvac_mode(self) -> HVACMode:
         """Derive HA HVAC mode from Tydom thermostat registers."""
+        if self._device.is_area_trv:
+            return HVACMode.HEAT
+
         if getattr(self, "_is_filpilote", False):
             # Derive from thermicLevel (the live pilot-wire order), not hvacMode:
             # the app/schedule set thermicLevel while hvacMode stays NORMAL.
@@ -2667,6 +2747,13 @@ class HaClimate(ClimateEntity, HAEntity):
     @property
     def hvac_action(self) -> HVACAction | None:
         """Return the current running action."""
+        if self._device.is_area_trv:
+            return (
+                HVACAction.HEATING
+                if getattr(self._device, "waterFlowReq", False)
+                else HVACAction.IDLE
+            )
+
         if getattr(self, "_is_filpilote", False):
             # No temperature feedback exists, so we cannot distinguish heating
             # from idle: report OFF when the order is STOP, HEATING otherwise.
@@ -2693,6 +2780,12 @@ class HaClimate(ClimateEntity, HAEntity):
     @property
     def current_temperature(self) -> float | None:
         """Return the current temperature."""
+        if self._device.is_area_trv:
+            for attribute in ("regTemperature", "devTemperature"):
+                temperature = getattr(self._device, attribute, None)
+                if temperature is not None:
+                    return float(temperature)
+
         if hasattr(self._device, "temperature"):
             temp = getattr(self._device, "temperature", None)
             if temp is not None:
@@ -2758,6 +2851,9 @@ class HaClimate(ClimateEntity, HAEntity):
 
     async def async_set_hvac_mode(self, hvac_mode):
         """Set new target hvac mode."""
+        if self._device.is_area_trv:
+            return
+
         if getattr(self, "_is_filpilote", False):
             # OFF -> pilot-wire STOP. HEAT -> keep the current heating order, or
             # default to Comfort when coming from STOP; the level is chosen via
@@ -2838,7 +2934,14 @@ class HaClimate(ClimateEntity, HAEntity):
 
     async def async_set_temperature(self, **kwargs):
         """Set new target temperature."""
-        await self._device.set_temperature(str(kwargs.get(ATTR_TEMPERATURE)))
+        temperature = kwargs.get(ATTR_TEMPERATURE)
+        if self._device.is_area_trv:
+            # Area thermostat commands use a JSON numeric value. The physical
+            # endpoint does not advertise setpoint metadata itself, so sending
+            # a string here can leave a perfectly valid local override ignored.
+            await self._device.set_temperature(float(temperature))
+            return
+        await self._device.set_temperature(str(temperature))
 
     @property
     def fan_mode(self) -> str | None:
@@ -3166,7 +3269,9 @@ class HaGate(CoverEntity, HAEntity):
         self._attr_unique_id = f"{self._device.device_id}_cover"
         self._attr_name = None  # primary entity inherits device name
         self._registered_sensors = []
-        self._attr_supported_features = _level_command_cover_features(device)
+        self._attr_supported_features = _level_command_cover_features(
+            device, allow_position=True
+        )
 
     async def async_added_to_hass(self) -> None:
         """Refresh on every device push (see HACover for the MRO rationale)."""
@@ -3197,15 +3302,26 @@ class HaGate(CoverEntity, HAEntity):
 
     @property
     def is_closed(self) -> bool | None:
-        """Return if the window is closed."""
-        if hasattr(self._device, "openState"):
-            open_state = getattr(self._device, "openState", None)
+        """Return whether the gate is closed when feedback is available.
+
+        Some compatible gate motors report the same ``level`` feedback as a
+        garage door, while ordinary dry-contact receivers expose no feedback at
+        all. Older gate profiles can instead report ``openState``.
+        """
+        level = getattr(self._device, "level", None)
+        if level is not None:
+            return level == 0
+
+        open_state = getattr(self._device, "openState", None)
+        if open_state is not None:
             return open_state == "LOCKED"
-        else:
-            LOGGER.warning(
-                "no attribute 'openState' for device %s", self._device.device_id
-            )
-            return None
+
+        return None
+
+    @property
+    def current_cover_position(self) -> int | None:
+        """Return the reported gate position when the endpoint provides it."""
+        return getattr(self._device, "level", None)
 
     async def async_open_cover(self, **kwargs: Any) -> None:
         """Open the gate."""
@@ -3218,6 +3334,10 @@ class HaGate(CoverEntity, HAEntity):
     async def async_stop_cover(self, **kwargs: Any) -> None:
         """Stop the gate."""
         await self._device.stop()
+
+    async def async_set_cover_position(self, **kwargs: Any) -> None:
+        """Set the gate position when its endpoint allows it."""
+        await self._device.set_level(kwargs[ATTR_POSITION])
 
     async def async_toggle(self, **kwargs: Any) -> None:
         """Toggle the gate without deriving direction from an unknown state."""
@@ -3443,6 +3563,13 @@ class HaAlarm(AlarmControlPanelEntity, HAEntity):
         "outTemperature": SensorStateClass.MEASUREMENT,
     }
 
+    _ACTOR_HISTORY_STATES = {
+        AlarmControlPanelState.DISARMED,
+        AlarmControlPanelState.ARMED_AWAY,
+        AlarmControlPanelState.ARMED_HOME,
+        AlarmControlPanelState.ARMED_NIGHT,
+    }
+
     def __init__(self, device: TydomAlarm, hass) -> None:
         """Initialize the sensor."""
         self.hass = hass
@@ -3452,7 +3579,13 @@ class HaAlarm(AlarmControlPanelEntity, HAEntity):
         self._attr_name = None  # primary entity inherits device name
         self._attr_code_format = CodeFormat.NUMBER
         self._attr_code_arm_required = True
+        self._attr_changed_by = None
+        self._changed_by_type: str | None = None
         self._registered_sensors = []
+        self._last_alarm_state = self.alarm_state
+        self._last_alarm_event_sequence = self._device.alarm_event_sequence
+        self._pending_alarm_actor: tuple[str, str, str] | None = None
+        self._open_issues_refresh_task = None
 
         self._attr_supported_features = (
             self._attr_supported_features
@@ -3465,15 +3598,143 @@ class HaAlarm(AlarmControlPanelEntity, HAEntity):
     async def async_added_to_hass(self) -> None:
         """Refresh on every device push (see HACover for the MRO rationale)."""
         await super().async_added_to_hass()
-        self._device.register_callback(self.async_write_ha_state)
+        self._device.register_callback(self._handle_alarm_update)
         self._device._ha_device = self
 
     async def async_will_remove_from_hass(self) -> None:
         """Remove the push callback registered in async_added_to_hass."""
-        self._device.remove_callback(self.async_write_ha_state)
+        self._device.remove_callback(self._handle_alarm_update)
+        if self._open_issues_refresh_task is not None:
+            self._open_issues_refresh_task.cancel()
         if hasattr(self._device, "_ha_device") and self._device._ha_device is self:
             self._device._ha_device = None
         await super().async_will_remove_from_hass()
+
+    def _handle_alarm_update(self) -> None:
+        """Publish alarm pushes and associate spontaneous actors with transitions."""
+        current_state = self.alarm_state
+        previous_state = self._last_alarm_state
+        self._last_alarm_state = current_state
+        event_sequence = self._device.alarm_event_sequence
+        has_new_actor = event_sequence != self._last_alarm_event_sequence
+        actor = self._device.latest_alarm_actor if has_new_actor else None
+        actor_type = self._device.latest_alarm_actor_type if has_new_actor else None
+        actor_target = self._device.latest_alarm_event_target if has_new_actor else None
+        self._last_alarm_event_sequence = event_sequence
+
+        state_changed = (
+            current_state != previous_state
+            and current_state in self._ACTOR_HISTORY_STATES
+        )
+        if state_changed:
+            self._attr_changed_by = None
+            self._changed_by_type = None
+            if (
+                actor
+                and actor_type
+                and self._actor_target_matches_state(actor_target, current_state)
+            ):
+                self._attr_changed_by = actor
+                self._changed_by_type = actor_type
+                self._pending_alarm_actor = None
+            elif self._pending_alarm_actor and self._actor_target_matches_state(
+                self._pending_alarm_actor[0], current_state
+            ):
+                self._attr_changed_by = self._pending_alarm_actor[1]
+                self._changed_by_type = self._pending_alarm_actor[2]
+                self._pending_alarm_actor = None
+            else:
+                self._pending_alarm_actor = None
+        elif actor and actor_type and actor_target:
+            if self._actor_target_matches_state(actor_target, current_state):
+                self._attr_changed_by = actor
+                self._changed_by_type = actor_type
+            else:
+                # TYDOM may publish eventAlarm just before alarmMode changes.
+                self._pending_alarm_actor = (actor_target, actor, actor_type)
+
+        self.async_write_ha_state()
+
+    def _schedule_open_issues_refresh(
+        self, *, after_unconfirmed_arm: bool = False
+    ) -> None:
+        """Fetch the central-reported blockers after a refused arm command."""
+        if (
+            self._open_issues_refresh_task is None
+            or self._open_issues_refresh_task.done()
+        ):
+            self._open_issues_refresh_task = self.hass.async_create_task(
+                self._async_refresh_open_issues(after_unconfirmed_arm),
+                "Refresh TYXAL open issues after refused arming",
+            )
+
+    async def _async_refresh_open_issues(
+        self, after_unconfirmed_arm: bool = False
+    ) -> None:
+        """Refresh issue details after an arm command that did not complete."""
+        if after_unconfirmed_arm:
+            # Some older gateways do not publish ACK or DENIED for alarm
+            # cdata. Give their normal state push time to arrive before
+            # deciding whether the command was refused.
+            await asyncio.sleep(_UNCONFIRMED_ARMING_SETTLE_DELAY)
+            if self.alarm_state != AlarmControlPanelState.DISARMED:
+                self._device.clear_open_issues()
+                self.async_write_ha_state()
+                return
+        else:
+            # The command result can precede the central's event/history
+            # update. Waiting avoids querying OPEN_ISSUES before it exists.
+            await asyncio.sleep(_REFUSED_ARMING_SETTLE_DELAY)
+        try:
+            # This is limited to refused or unconfirmed arm attempts. Use the
+            # normal history timeout, rather than the short startup probe for
+            # optional alarm-history sensors.
+            await self._device.get_open_issues()
+        except TydomOpenIssuesNotReadyError:
+            # One central reports the DENIED command outcome before publishing
+            # its refusal event. Retry once after the history record settles.
+            await asyncio.sleep(_OPEN_ISSUES_RETRY_DELAY)
+            try:
+                await self._device.get_open_issues()
+            except Exception:
+                LOGGER.debug(
+                    "Unable to retrieve detailed open issues after refused arming for %s",
+                    self._device.device_id,
+                    exc_info=True,
+                )
+        except Exception:
+            LOGGER.debug(
+                "Unable to retrieve detailed open issues after refused arming for %s",
+                self._device.device_id,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _actor_target_matches_state(target, state) -> bool:
+        """Return whether an actor event describes the current HA alarm state."""
+        if target == "disarmed":
+            return state == AlarmControlPanelState.DISARMED
+        return target == "armed" and state in {
+            AlarmControlPanelState.ARMED_AWAY,
+            AlarmControlPanelState.ARMED_HOME,
+            AlarmControlPanelState.ARMED_NIGHT,
+        }
+
+    @property
+    def changed_by(self) -> str | None:
+        """Return the actor resolved for the latest alarm transition."""
+        return self._attr_changed_by
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return alarm actor metadata and current central-reported issues."""
+        attributes: dict[str, Any] = {}
+        if self._changed_by_type is not None:
+            attributes["changed_by_type"] = self._changed_by_type
+        if self._device.open_issues is not None:
+            attributes["open_issue_count"] = len(self._device.open_issues)
+            attributes["open_issues"] = self._device.open_issues
+        return attributes
 
     @property
     def alarm_state(self) -> AlarmControlPanelState:
@@ -3540,23 +3801,57 @@ class HaAlarm(AlarmControlPanelEntity, HAEntity):
 
     async def async_alarm_disarm(self, code=None) -> None:
         """Send disarm command."""
-        await self._device.alarm_disarm(code)
+        await self._run_alarm_command(self._device.alarm_disarm(code), "disarming")
 
     async def async_alarm_arm_away(self, code=None) -> None:
         """Send arm away command."""
-        await self._device.alarm_arm_away(code)
+        await self._run_alarm_command(self._device.alarm_arm_away(code), "arming")
 
     async def async_alarm_arm_home(self, code=None) -> None:
         """Send arm home command."""
-        await self._device.alarm_arm_home(code)
+        await self._run_alarm_command(self._device.alarm_arm_home(code), "arming")
 
     async def async_alarm_arm_night(self, code=None) -> None:
         """Send arm night command."""
-        await self._device.alarm_arm_night(code)
+        await self._run_alarm_command(self._device.alarm_arm_night(code), "arming")
 
     async def async_alarm_trigger(self, code=None) -> None:
         """Send alarm trigger command."""
-        await self._device.alarm_trigger(code)
+        await self._run_alarm_command(self._device.alarm_trigger(code), "triggering")
+
+    async def _run_alarm_command(self, command, operation: str) -> None:
+        """Run an alarm command and expose a negative gateway result in HA."""
+        try:
+            command_confirmed = await command
+        except TydomAlarmCommandError as err:
+            if err.result == "DENIED":
+                if operation == "arming":
+                    self._schedule_open_issues_refresh()
+                raise HomeAssistantError(
+                    f"The alarm system refused {operation}. Check the reported "
+                    "defects before trying again."
+                ) from err
+            raise HomeAssistantError(
+                f"The alarm system rejected {operation} ({err.result})."
+            ) from err
+        if operation == "arming" and command_confirmed is False:
+            # The gateway did not publish ACK/DENIED. Check its state after a
+            # short delay and retrieve blockers only if it remained disarmed.
+            self._schedule_open_issues_refresh(after_unconfirmed_arm=True)
+        elif operation == "arming":
+            self._device.clear_open_issues()
+            self.async_write_ha_state()
+
+    async def async_force_arm(self, code: str, mode: str) -> None:
+        """Force arming only after an explicit Home Assistant action."""
+        try:
+            await self._device.force_arm(mode, code)
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from err
+        except TydomAlarmCommandError as err:
+            raise HomeAssistantError(
+                f"The alarm system rejected forced arming ({err.result})."
+            ) from err
 
     async def async_acknowledge_events(self, code=None) -> None:
         """Acknowledge alarm events."""
@@ -3565,6 +3860,10 @@ class HaAlarm(AlarmControlPanelEntity, HAEntity):
     async def async_get_events(self, event_type=None) -> list:
         """Get alarm events."""
         return await self._device.get_events(event_type or "UNACKED_EVENTS")
+
+    async def async_get_open_issues(self) -> list:
+        """Return the products the central currently reports as blocking arming."""
+        return await self._device.get_open_issues()
 
     async def async_get_alarm_products(self) -> dict[str, list[dict[str, Any]]]:
         """Return the products and zones configured on the alarm."""
@@ -4958,8 +5257,11 @@ class HAScene(Scene, HAEntity):
         - Otherwise TWC scenes use virtual zone (Day/Night) devices
         - Other scenes are grouped into a virtual "Scènes Tydom" device
         """
-        # Get gateway device ID for via_device fallback
+        # Get gateway identifiers for the parent device link.
         gateway_device_id = self._get_tydom_gateway_device_id()
+        gateway_registry_device_id = _get_tydom_gateway_registry_device_id(
+            self.hass, self._device
+        )
 
         # Ensure gateway_device_id is available - if not, we can't create proper device_info
         if not gateway_device_id:
@@ -5012,8 +5314,9 @@ class HAScene(Scene, HAEntity):
                             "identifiers": {(DOMAIN, registry_device_id)},
                             "name": str(tywell_device.device_name),
                             "manufacturer": "Delta Dore",
-                            "via_device": (DOMAIN, str(gateway_device_id)),
                         }
+                        if gateway_registry_device_id:
+                            device_info["via_device_id"] = gateway_registry_device_id
                         product_name = getattr(tywell_device, "productName", None)
                         if product_name:
                             device_info["model"] = str(product_name)
@@ -5033,7 +5336,8 @@ class HAScene(Scene, HAEntity):
                 "model": "Tywell Control",
             }
 
-            device_info["via_device"] = (DOMAIN, gateway_device_id)
+            if gateway_registry_device_id:
+                device_info["via_device_id"] = gateway_registry_device_id
 
             LOGGER.debug(
                 "TWC scene device_info: scene=%s, is_twc=%s, zone=%s, device_identifier=%s",
@@ -5053,8 +5357,8 @@ class HAScene(Scene, HAEntity):
                 "manufacturer": "Delta Dore",
                 "model": "Tydom Scenes",
             }
-            if gateway_device_id:
-                info["via_device"] = (DOMAIN, gateway_device_id)
+            if gateway_registry_device_id:
+                info["via_device_id"] = gateway_registry_device_id
             return info
 
     async def async_added_to_hass(self) -> None:
@@ -5187,11 +5491,19 @@ class HAScene(Scene, HAEntity):
             # Find entities for each affected device
             related_entities = []
             found_devices = []
+            hub = self._get_hub()
+            entry = getattr(hub, "_entry", None)
+            if entry is None:
+                LOGGER.debug(
+                    "Cannot resolve scene-device relations for %s without its config entry",
+                    self._device.device_id,
+                )
+                return
 
             for affected_device_id in affected_device_ids:
-                # Find the device in the registry
-                device_entry = device_registry.async_get_device(
-                    identifiers={(DOMAIN, affected_device_id)}
+                # Device identifiers are scoped to one TYDOM config entry.
+                device_entry = device_registry.async_get_device_by_identifier(
+                    (DOMAIN, affected_device_id), entry.entry_id
                 )
 
                 if not device_entry:
@@ -5590,13 +5902,17 @@ class HAMoment(SwitchEntity, HAEntity):
     @property
     def device_info(self) -> DeviceInfo:
         """Return information to link this entity with the gateway device."""
-        return {
+        info: DeviceInfo = {
             "identifiers": {(DOMAIN, self._device.device_id)},
             "name": self._device.device_name,
             "manufacturer": "Delta Dore",
             "model": "Tydom Moment",
-            "via_device": (DOMAIN, self._get_tydom_gateway_device_id() or ""),
         }
+        if gateway_registry_device_id := _get_tydom_gateway_registry_device_id(
+            self.hass, self._device
+        ):
+            info["via_device_id"] = gateway_registry_device_id
+        return info
 
     @property
     def is_on(self) -> bool:
@@ -5637,6 +5953,19 @@ class HASwitch(SwitchEntity, HAEntity):
     _attr_should_poll = False
     _attr_has_entity_name = True
     _attr_icon = "mdi:toggle-switch"
+
+    sensor_classes = {
+        "energyInstantTotElecP": SensorDeviceClass.POWER,
+        "energyTotIndexWatt": SensorDeviceClass.ENERGY,
+    }
+    state_classes = {
+        "energyInstantTotElecP": SensorStateClass.MEASUREMENT,
+        "energyTotIndexWatt": SensorStateClass.TOTAL_INCREASING,
+    }
+    units = {
+        "energyInstantTotElecP": UnitOfPower.WATT,
+        "energyTotIndexWatt": UnitOfEnergy.WATT_HOUR,
+    }
 
     def __init__(self, device: TydomDevice, hass) -> None:
         """Initialize HASwitch."""
@@ -5855,9 +6184,10 @@ class HAGroupEntity(HAEntity):
             "manufacturer": "Delta Dore",
             "model": f"Tydom {self._device.group_usage.title()} Group",
         }
-        gateway_device_id = self._get_tydom_gateway_device_id()
-        if gateway_device_id is not None:
-            info["via_device"] = (DOMAIN, gateway_device_id)
+        if gateway_registry_device_id := _get_tydom_gateway_registry_device_id(
+            self.hass, self._device
+        ):
+            info["via_device_id"] = gateway_registry_device_id
         return info
 
     @property
@@ -6447,6 +6777,467 @@ class HAButton(ButtonEntity, HAEntity):
             )
 
 
+ASSOCIATION_COMMAND = "modeAsso"
+IDENTIFY_COMMAND = "localisation"
+_COMMAND_START_VALUE = "START"
+
+
+def supports_command(device: Any, command: str) -> bool:
+    """Return whether an endpoint advertises a writable START command."""
+    metadata = getattr(device, "_metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    command_metadata = metadata.get(command)
+    if not isinstance(command_metadata, dict):
+        return False
+    permission = str(command_metadata.get("permission", "")).lower()
+    values = command_metadata.get("enum_values")
+    return (
+        "w" in permission
+        and isinstance(values, list)
+        and _COMMAND_START_VALUE in values
+    )
+
+
+async def start_command(device: Any, command: str) -> None:
+    """Run an association or localisation command advertised by a device."""
+    if not supports_command(device, command):
+        raise ValueError(f"Device does not support the {command} command")
+    endpoint_id = getattr(device, "_endpoint", None)
+    if endpoint_id is None:
+        raise ValueError("Device has no TYDOM endpoint")
+    await device._tydom_client.put_devices_data(
+        device._id,
+        endpoint_id,
+        command,
+        _COMMAND_START_VALUE,
+    )
+
+
+class HADeviceAssociationButton(ButtonEntity, HAEntity):
+    """Button for an association capability advertised by one product."""
+
+    _attr_should_poll = False
+    _attr_has_entity_name = True
+
+    def __init__(self, device: TydomDevice, hass, command: str) -> None:
+        """Initialise an association or physical-identification button."""
+        action_name, icon = {
+            ASSOCIATION_COMMAND: (
+                "Démarrer le mode association",
+                "mdi:link-variant-plus",
+            ),
+            IDENTIFY_COMMAND: ("Identifier l'appareil", "mdi:map-marker-radius"),
+        }[command]
+        self.hass = hass
+        self._device = device
+        self._association_command = command
+        self._attr_icon = icon
+        self._attr_name = action_name
+        self._attr_unique_id = f"{device.device_id}_button_{command}"
+
+    async def async_added_to_hass(self) -> None:
+        """Refresh when the associated product is updated."""
+        await super().async_added_to_hass()
+        self._device.register_callback(self.async_write_ha_state)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Detach the update callback without replacing the primary entity."""
+        self._device.remove_callback(self.async_write_ha_state)
+        await super().async_will_remove_from_hass()
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Attach this control to the existing physical product."""
+        if isinstance(self._device, TydomInterrupter):
+            return self._enrich_device_info(
+                {
+                    "identifiers": {
+                        (DOMAIN, f"interrupter_{self._device.physical_device_id}")
+                    },
+                    "name": self._device.interrupter_name,
+                    "manufacturer": "Delta Dore",
+                    "model": self._device.interrupter_model,
+                }
+            )
+
+        if isinstance(self._device, TydomRemoteControl):
+            return self._enrich_device_info(
+                {
+                    "identifiers": {
+                        (
+                            DOMAIN,
+                            f"remote_control_{self._device.physical_device_id}",
+                        )
+                    },
+                    "name": self._device.remote_name,
+                    "manufacturer": "Delta Dore",
+                    "model": self._device.remote_model,
+                }
+            )
+
+        # Auxiliary protocol endpoints (e.g. the weather endpoint grouped
+        # under a Tywell controller) share a physical registry identity with
+        # their parent.  The control must use that same identity: otherwise
+        # Home Assistant creates a separate generic ``Produit N`` device only
+        # to host the button.
+        registry_device_id = str(
+            getattr(self._device, "registry_device_id", self._device.device_id)
+        )
+        grouped_with_parent = registry_device_id != self._device.device_id
+        registry_device_name = str(
+            getattr(
+                self._device,
+                "registry_device_name",
+                getattr(self._device, "device_name", self._device.device_id),
+            )
+        )
+        device_info = self._get_device_info()
+        info: DeviceInfo = {
+            "identifiers": {(DOMAIN, registry_device_id)},
+            "name": registry_device_name
+            if grouped_with_parent
+            else getattr(self._device, "device_name", self._device.device_id),
+            "manufacturer": device_info["manufacturer"],
+        }
+        if "model" in device_info:
+            info["model"] = device_info["model"]
+        return self._enrich_device_info(info)
+
+    async def async_press(self) -> None:
+        """Run the START command advertised by this endpoint."""
+        await start_command(self._device, self._association_command)
+
+
+class HADeviceRemovalButton(HADeviceAssociationButton):
+    """Control for permanently removing one product."""
+
+    # This is an administrative gateway operation, never a day-to-day device
+    # control.  Keeping it in Configuration also avoids confusing it with the
+    # event entities which report real presses on physical remotes.
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, device: TydomDevice, hass, removal_callback=None) -> None:
+        """Initialise a permanent-removal control.
+
+        The gateway is the one exceptional device: removing it would sever the
+        entire integration, so keep that control opt-in.  Radio products remain
+        immediately removable by default.
+        """
+        self.hass = hass
+        self._device = device
+        self._removal_callback = removal_callback
+        self._attr_icon = "mdi:link-variant-remove"
+        self._attr_entity_registry_enabled_default = not isinstance(device, Tydom)
+        if isinstance(device, (TydomInterrupter, TydomRemoteControl)):
+            button_number = getattr(device, "button_number", None)
+            self._attr_name = (
+                f"Dissocier le bouton {button_number}"
+                if button_number is not None
+                else "Dissocier ce bouton"
+            )
+        else:
+            self._attr_name = "Dissocier définitivement l'appareil"
+        self._attr_unique_id = f"{device.device_id}_button_remove_association"
+
+    @property
+    def available(self) -> bool:
+        """Keep this explicit user control available whenever its product exists."""
+        return self._device is not None
+
+    async def async_press(self) -> None:
+        """Permanently remove this product from its TYDOM gateway."""
+        if self._removal_callback is None:
+            raise HomeAssistantError(
+                "No safe TYDOM product-removal workflow is available"
+            )
+        await self._removal_callback(self._device)
+
+
+class HAGroupableProductFinalizeAssociationButton(HADeviceAssociationButton):
+    """Finalize the configuration of one discovered multi-channel product."""
+
+    _attr_icon = "mdi:form-select"
+
+    def __init__(
+        self,
+        device: TydomDevice,
+        hass,
+        product_label: str,
+        channel: str,
+        usage_label: str,
+        callback,
+    ) -> None:
+        """Initialise the safe post-discovery configuration action."""
+        self.hass = hass
+        self._device = device
+        self._product_label = product_label
+        self._channel = channel
+        self._callback = callback
+        self._attr_name = f"Configurer {channel} comme {usage_label}"
+        self._attr_unique_id = f"{device.device_id}_button_finalize_{product_label.lower().replace(' ', '_')}"
+
+    async def async_press(self) -> None:
+        """Persist the selected channel with its official product metadata."""
+        await self._callback(self._device, self._channel)
+
+
+class _GatewayAssociationEntity:
+    """Shared Home Assistant device information for gateway controls."""
+
+    _attr_should_poll = False
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, tydom_hub) -> None:
+        """Attach a control to its configured TYDOM gateway."""
+        self._hub = tydom_hub
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, tydom_hub.hub_id)},
+            name=tydom_hub._name,
+            manufacturer=tydom_hub.manufacturer,
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to selection changes made by companion controls."""
+        await super().async_added_to_hass()
+        self._hub.register_association_control(self)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop receiving selection changes after removal."""
+        self._hub.unregister_association_control(self)
+        await super().async_will_remove_from_hass()
+
+
+class HAGatewayAssociationCategorySelect(_GatewayAssociationEntity, SelectEntity):
+    """Choose the intended usage before choosing a product family."""
+
+    _attr_icon = "mdi:shape-outline"
+
+    def __init__(self, tydom_hub) -> None:
+        """Initialise the association-category selector."""
+        super().__init__(tydom_hub)
+        self._attr_unique_id = f"{tydom_hub.hub_id}_association_category"
+        self._attr_name = "1. Catégorie à associer"
+
+    @property
+    def options(self) -> list[str]:
+        """Return the product categories from the official workflow."""
+        return list(self._hub.association_categories)
+
+    @property
+    def current_option(self) -> str:
+        """Return the selected product category."""
+        return self._hub.association_category
+
+    async def async_select_option(self, option: str) -> None:
+        """Select a category and reset the product selection if needed."""
+        self._hub.set_association_category(option)
+
+
+class HAGatewayAssociationProductSelect(_GatewayAssociationEntity, SelectEntity):
+    """Choose a product family compatible with the selected category."""
+
+    _attr_icon = "mdi:devices"
+
+    def __init__(self, tydom_hub) -> None:
+        """Initialise the product-family selector."""
+        super().__init__(tydom_hub)
+        self._attr_unique_id = f"{tydom_hub.hub_id}_association_product"
+        self._attr_name = "2. Produit à associer"
+
+    @property
+    def options(self) -> list[str]:
+        """Return products for the selected category only."""
+        return list(self._hub.association_product_labels)
+
+    @property
+    def current_option(self) -> str:
+        """Return the selected product-family label."""
+        return self._hub.association_product_label
+
+    async def async_select_option(self, option: str) -> None:
+        """Select the protocol profile represented by an option."""
+        self._hub.set_association_product(option)
+
+
+class HAGatewayAssociationChannelSelect(_GatewayAssociationEntity, SelectEntity):
+    """Choose an independently associated channel where the product has one."""
+
+    _attr_icon = "mdi:gesture-tap-button"
+
+    def __init__(self, tydom_hub) -> None:
+        """Initialise the physical-channel selector."""
+        super().__init__(tydom_hub)
+        self._attr_unique_id = f"{tydom_hub.hub_id}_association_channel"
+        self._attr_name = "3. Voie à associer"
+
+    @property
+    def available(self) -> bool:
+        """Only expose this selector for products with independent channels."""
+        return bool(self._hub.association_channel_labels)
+
+    @property
+    def options(self) -> list[str]:
+        """Return physical channels documented for the selected product."""
+        return list(self._hub.association_channel_labels)
+
+    @property
+    def current_option(self) -> str | None:
+        """Return the selected physical channel."""
+        return self._hub.association_channel_label
+
+    @property
+    def extra_state_attributes(self) -> dict[str, list[str]]:
+        """Show the model-specific physical procedure in the entity dialog."""
+        return {"instructions": list(self._hub.association_instructions)}
+
+    async def async_select_option(self, option: str) -> None:
+        """Select a physical channel."""
+        self._hub.set_association_channel(option)
+
+
+class HAGatewayAssociationUsageSelect(_GatewayAssociationEntity, SelectEntity):
+    """Choose the supported application usage for the selected product."""
+
+    _attr_icon = "mdi:format-list-bulleted-type"
+
+    def __init__(self, tydom_hub) -> None:
+        """Initialise the product-usage selector."""
+        super().__init__(tydom_hub)
+        self._attr_unique_id = f"{tydom_hub.hub_id}_association_usage"
+        self._attr_name = "4. Usage / type d'association"
+
+    @property
+    def options(self) -> list[str]:
+        """Return only usages documented for the selected product."""
+        return list(self._hub.association_usage_labels)
+
+    @property
+    def current_option(self) -> str:
+        """Return the selected application usage."""
+        return self._hub.association_usage_label
+
+    async def async_select_option(self, option: str) -> None:
+        """Select a valid product usage and its exact discovery recipe."""
+        self._hub.set_association_usage(option)
+
+
+class HAGatewayAssociationNameText(_GatewayAssociationEntity, TextEntity):
+    """Choose the optional product name before starting its association."""
+
+    _attr_icon = "mdi:form-textbox"
+    _attr_mode = TextMode.TEXT
+    _attr_native_max = 64
+
+    def __init__(self, tydom_hub) -> None:
+        """Initialise the optional association-name field."""
+        super().__init__(tydom_hub)
+        self._attr_unique_id = f"{tydom_hub.hub_id}_association_name"
+        self._attr_name = "Nom de l'appareil (facultatif)"
+
+    @property
+    def available(self) -> bool:
+        """Show the field for every product the gateway can associate."""
+        return self._hub.association_name_supported
+
+    @property
+    def native_value(self) -> str:
+        """Return the optional name, or an empty field by default."""
+        return self._hub.association_name
+
+    async def async_set_value(self, value: str) -> None:
+        """Store the value until the selected association is finalised."""
+        self._hub.set_association_name(value)
+
+
+class HAGatewayAssociationGuideButton(_GatewayAssociationEntity, ButtonEntity):
+    """Display a model-specific association procedure in Home Assistant."""
+
+    _attr_icon = "mdi:book-open-variant"
+
+    def __init__(self, tydom_hub) -> None:
+        """Initialise the association guide button."""
+        super().__init__(tydom_hub)
+        self._attr_unique_id = f"{tydom_hub.hub_id}_association_guide"
+        self._attr_name = "5. Afficher le guide d'association"
+
+    @property
+    def available(self) -> bool:
+        """Only show a guide when the selected product has one."""
+        return bool(self._hub.association_instructions)
+
+    async def async_press(self) -> None:
+        """Open the selected procedure in the local HA guide dialog."""
+        channel = self._hub.association_channel_label
+        title = f"{self._hub.association_product_label} — guide d'association"
+        if channel:
+            title = f"{title} ({channel})"
+        overview_id, illustration_ids, stepwise_illustrations = (
+            self._hub.association_illustration_layout
+        )
+        overview = (
+            get_association_illustration_data_url(overview_id)
+            if overview_id is not None
+            else None
+        )
+        illustrations = [
+            image
+            for image_id in illustration_ids
+            if (image := get_association_illustration_data_url(image_id)) is not None
+        ]
+        start_association_entity_id = None
+        try:
+            from homeassistant.helpers import entity_registry as er
+
+            registry = er.async_get(self.hass)
+            start_association_entity_id = registry.async_get_entity_id(
+                "button",
+                DOMAIN,
+                f"{self._hub.hub_id}_start_product_association",
+            )
+        except (AttributeError, KeyError, TypeError):
+            # The guide remains usable during setup before the companion
+            # button has been registered. The normal configuration page still
+            # exposes the action in that short-lived situation.
+            pass
+        self.hass.bus.async_fire(
+            ASSOCIATION_GUIDE_EVENT,
+            {
+                "title": title,
+                "instructions": list(self._hub.association_instructions),
+                "overview": overview,
+                "illustrations": illustrations,
+                "illustration_mode": ("steps" if stepwise_illustrations else "gallery"),
+                "illustration_step_indexes": list(
+                    getattr(self._hub, "association_illustration_step_indexes", ())
+                ),
+                "start_association_entity_id": start_association_entity_id,
+            },
+        )
+
+
+class HAGatewayStartAssociationButton(_GatewayAssociationEntity, ButtonEntity):
+    """Start the generic add-product workflow on the selected gateway."""
+
+    _attr_icon = "mdi:link-plus"
+
+    def __init__(self, tydom_hub) -> None:
+        """Initialise the start-association button."""
+        super().__init__(tydom_hub)
+        self._attr_unique_id = f"{tydom_hub.hub_id}_start_product_association"
+        self._attr_name = "6. Lancer l'écoute de la passerelle"
+
+    @property
+    def available(self) -> bool:
+        """Disable the action if the category has no local install profile."""
+        return self._hub.association_product_supported
+
+    async def async_press(self) -> None:
+        """Start association using the selected product family."""
+        await self._hub.start_selected_product_association()
+
+
 class HAAlarmAcknowledgeButton(ButtonEntity, HAEntity):
     """Button which acknowledges pending TYXAL alarm events."""
 
@@ -6479,6 +7270,53 @@ class HAAlarmAcknowledgeButton(ButtonEntity, HAEntity):
         await self._device.acknowledge_events()
 
 
+class HACancelBoostButton(ButtonEntity, HAEntity):
+    """Button which cancels an active Boost on an area-backed TRV."""
+
+    _attr_should_poll = False
+    _attr_has_entity_name = True
+    _attr_translation_key = "cancel_boost"
+    _attr_icon = "mdi:timer-off-outline"
+
+    def __init__(self, device: TydomBoiler, hass) -> None:
+        """Initialise the TRV Boost cancellation button."""
+        self.hass = hass
+        self._device = device
+        self._attr_unique_id = f"{device.device_id}_cancel_boost"
+
+    @property
+    def available(self) -> bool:
+        """Expose the control only while the TRV reports an active Boost."""
+        return super().available and self._device.boost_active
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Link the button to the physical radiator thermostat."""
+        device_info = self._get_device_info()
+        info: DeviceInfo = {
+            "identifiers": {(DOMAIN, self._device.device_id)},
+            "name": self._device.device_name,
+            "manufacturer": device_info["manufacturer"],
+        }
+        if "model" in device_info:
+            info["model"] = device_info["model"]
+        return self._enrich_device_info(info)
+
+    async def async_added_to_hass(self) -> None:
+        """Refresh availability whenever TYDOM publishes area state."""
+        await super().async_added_to_hass()
+        self._device.register_callback(self.async_write_ha_state)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Remove the update callback when Home Assistant removes the button."""
+        self._device.remove_callback(self.async_write_ha_state)
+        await super().async_will_remove_from_hass()
+
+    async def async_press(self) -> None:
+        """Cancel the active Boost without changing the normal setpoint."""
+        await self._device.cancel_boost()
+
+
 class HAAlarmPendingEventsSensor(SensorEntity, HAEntity):
     """Dashboard-friendly view of unacknowledged TYXAL alarm events."""
 
@@ -6495,6 +7333,7 @@ class HAAlarmPendingEventsSensor(SensorEntity, HAEntity):
         self._attr_unique_id = f"{device.device_id}_pending_alarm_events"
         self._last_unacked_state = bool(getattr(device, "unackedEvent", False))
         self._refresh_task = None
+        self._automatic_history_supported = True
 
     @property
     def native_value(self) -> int | None:
@@ -6559,6 +7398,8 @@ class HAAlarmPendingEventsSensor(SensorEntity, HAEntity):
 
     def _schedule_refresh(self) -> None:
         """Schedule one history request without delaying entity setup."""
+        if not self._automatic_history_supported:
+            return
         if self._refresh_task is None or self._refresh_task.done():
             self._refresh_task = self.hass.async_create_task(
                 self._async_refresh_events(),
@@ -6568,11 +7409,21 @@ class HAAlarmPendingEventsSensor(SensorEntity, HAEntity):
     async def _async_refresh_events(self) -> None:
         """Fetch the bounded list advertised by the TYXAL history endpoint."""
         try:
-            await self._device.get_events("UNACKED_EVENTS")
+            await self._device.get_events(
+                "UNACKED_EVENTS",
+                timeout=_AUTOMATIC_ALARM_HISTORY_TIMEOUT,
+                log_timeout=False,
+            )
         except Exception:
-            LOGGER.exception(
-                "Unable to refresh unacknowledged events for %s",
+            # Some TYDOM2 gateways expose ``unackedEvent`` but never answer
+            # the optional detailed-history request. Probe once per load, then
+            # retain the pushed boolean as the authoritative state.
+            self._automatic_history_supported = False
+            LOGGER.debug(
+                "Detailed unacknowledged-event history is unavailable for %s; "
+                "automatic refresh disabled until the integration is reloaded",
                 self._device.device_id,
+                exc_info=True,
             )
 
 
@@ -6595,10 +7446,21 @@ class HAReloadButton(ButtonEntity):
             name=hub._name,
             manufacturer=hub.manufacturer,
         )
+        hub.register_association_control(self)
+
+    @property
+    def available(self) -> bool:
+        """Avoid concurrent inventory rebuilds from the gateway page."""
+        return not self._hub.inventory_syncing
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str]:
+        """Expose explicit progress instead of making disappearance look final."""
+        return {"synchronisation": self._hub.inventory_sync_status}
 
     async def async_press(self) -> None:
         """Handle the button press."""
-        await self._hub.reload_devices()
+        await self._hub.reload_devices_with_status()
 
 
 class HARefreshEnergyButton(ButtonEntity):
@@ -6788,11 +7650,13 @@ class HARemoteEvent(EventEntity, HAEntity):
         self._last_event_sequence = device.event_sequence
         self._attr_unique_id = f"{self._device.device_id}_remote_event"
         button_number = device.button_number
-        self._attr_name = (
-            f"Button {button_number}"
-            if button_number is not None
-            else device.device_name
-        )
+        if button_number is None:
+            self._attr_name = device.device_name
+        else:
+            self._attr_translation_key = "remote_button"
+            self._attr_translation_placeholders = {
+                "button_number": str(button_number),
+            }
 
     async def async_added_to_hass(self) -> None:
         """Listen for fresh actions from this physical button endpoint."""
@@ -6972,11 +7836,13 @@ class HAInterrupterEvent(EventEntity, HAEntity):
         self._device._ha_device = self
         self._last_event_sequence = device.event_sequence
         self._attr_unique_id = f"{self._device.device_id}_interrupter_event"
-        self._attr_name = (
-            f"Button {device.button}"
-            if device.button is not None
-            else device.device_name
-        )
+        if device.button is None:
+            self._attr_name = device.device_name
+        else:
+            self._attr_translation_key = "interrupter_button"
+            self._attr_translation_placeholders = {
+                "button_number": str(device.button),
+            }
 
     async def async_added_to_hass(self) -> None:
         """Listen for fresh actions from this physical button endpoint."""

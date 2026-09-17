@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import copy
 import json
 import os
 import re
@@ -38,6 +39,7 @@ from .const import (
     MEDIATION_URL,
 )
 from .MessageHandler import MessageHandler
+from .tydom_devices import TydomAlarmCommandError
 
 if TYPE_CHECKING:
     from .tydom_devices import TydomDevice
@@ -98,7 +100,15 @@ class TydomClientApiClientAuthenticationError(TydomClientApiClientError):
     """Exception to indicate an authentication error."""
 
 
+class TydomLocalPasswordPairingError(TydomClientApiClientError):
+    """The physical-button local-password pairing did not complete."""
+
+
 proxy = None
+
+_LOCAL_PASSWORD_URI = "/configs/gateway/password"
+_LOCAL_PASSWORD_MAX_MESSAGES = 5
+_LOCAL_PASSWORD_MAX_RESPONSE_BYTES = 64 * 1024
 
 # DEBUG ONLY — replaces websocket with a local trace file
 file_mode = False
@@ -175,6 +185,15 @@ class TydomClient:
             str, tuple[float, bool]
         ] = {}  # endpoint -> (timestamp, is_valid)
         self._metadata_cache_ttl = 3600.0  # 1 hour in seconds
+        # Older TYDOM gateways do not expose every optional endpoint. Once a
+        # 404 confirms that a feature is absent, avoid querying it on every
+        # reconnect or inventory reload.
+        self._unsupported_optional_paths: set[str] = set()
+        # The current official application uses /devices/install for product
+        # discovery. Some older or vendor-specific gateway firmware retains
+        # the former /devices action instead; remember an explicit fallback
+        # for the lifetime of this client.
+        self._device_discovery_endpoint = "/devices/install"
 
     def update_config(self, zone_home: str, zone_away: str, zone_night: str):
         """Update zones configuration."""
@@ -281,6 +300,150 @@ class TydomClient:
                 "Something really wrong happened!"
             ) from exception
 
+    @staticmethod
+    def _extract_local_gateway_password(message: bytes) -> str | None:
+        """Extract a paired gateway password from one TYDOM HTTP response.
+
+        The button-gated websocket can also carry ordinary gateway events.  A
+        response is accepted only when it is for the password resource, and
+        its JSON body contains a non-empty ``current`` value.  The caller must
+        never log the returned value.
+        """
+        header_bytes, separator, body = message.partition(b"\r\n\r\n")
+        if not separator:
+            return None
+
+        header_text = header_bytes.decode("latin-1", errors="replace")
+        if _LOCAL_PASSWORD_URI not in header_text:
+            return None
+
+        headers = {
+            name.strip().lower(): value.strip()
+            for line in header_text.split("\r\n")[1:]
+            if ":" in line
+            for name, value in [line.split(":", 1)]
+        }
+        payload = body
+        if "chunked" in headers.get("transfer-encoding", "").lower():
+            chunks = bytearray()
+            cursor = 0
+            while True:
+                line_end = body.find(b"\r\n", cursor)
+                if line_end < 0:
+                    return None
+                try:
+                    chunk_size = int(body[cursor:line_end], 16)
+                except ValueError:
+                    return None
+                cursor = line_end + 2
+                if len(body) < cursor + chunk_size + 2:
+                    return None
+                if chunk_size == 0:
+                    payload = bytes(chunks)
+                    break
+                chunks.extend(body[cursor : cursor + chunk_size])
+                cursor += chunk_size
+                if body[cursor : cursor + 2] != b"\r\n":
+                    return None
+                cursor += 2
+        elif "content-length" in headers:
+            try:
+                payload = body[: int(headers["content-length"])]
+            except ValueError:
+                return None
+
+        try:
+            current = json.loads(payload.decode("utf-8"))["current"]
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+            return None
+        return current if isinstance(current, str) and current else None
+
+    @classmethod
+    async def async_read_local_gateway_password(cls, hass, host: str, mac: str) -> str:
+        """Read a gateway's local password during its physical pairing window.
+
+        TYDOM opens this unauthenticated websocket route only briefly after a
+        physical press on the gateway.  This method is deliberately called
+        only by the explicit setup flow; it never probes or retries in the
+        background.
+        """
+        if host == MEDIATION_URL:
+            raise TydomLocalPasswordPairingError(
+                "Local button pairing requires the gateway's local host"
+            )
+
+        sslcontext = await asyncio.to_thread(ssl.create_default_context)
+        sslcontext.options |= 0x4  # OP_LEGACY_SERVER_CONNECT
+        sslcontext.check_hostname = False
+        sslcontext.verify_mode = ssl.CERT_NONE
+        session = async_create_clientsession(hass, False)
+        connection = None
+
+        try:
+            async with async_timeout.timeout(TIMEOUT_NORMAL_REQUEST):
+                connection = await session.ws_connect(
+                    method="GET",
+                    url=(f"wss://{host}:443/mediation/client?mac={mac}&appli=1"),
+                    headers={"Sec-WebSocket-Version": "13"},
+                    autoping=True,
+                    heartbeat=2.0,
+                    timeout=TIMEOUT_WEBSOCKET_CONNECT,  # type: ignore[arg-type]
+                    receive_timeout=TIMEOUT_WEBSOCKET_RECEIVE,
+                    autoclose=True,
+                    proxy=proxy,
+                    ssl=sslcontext,
+                )
+                request = (
+                    f"GET {_LOCAL_PASSWORD_URI} HTTP/1.1\r\n"
+                    "Content-Length: 0\r\n"
+                    "Content-Type: application/json; charset=UTF-8\r\n"
+                    "Transac-Id: 0\r\n\r\n"
+                )
+                await connection.send_bytes(request.encode("ascii"))
+
+                response = bytearray()
+                for _ in range(_LOCAL_PASSWORD_MAX_MESSAGES):
+                    message = await connection.receive()
+                    if message.type == WSMsgType.TEXT:
+                        raw_message = message.data.encode("utf-8")
+                    elif message.type == WSMsgType.BINARY:
+                        raw_message = bytes(message.data)
+                    else:
+                        continue
+
+                    password = cls._extract_local_gateway_password(raw_message)
+                    if password is not None:
+                        return password
+
+                    # A response can be split across websocket messages, but
+                    # unrelated gateway events must never become part of the
+                    # password-response buffer.
+                    if _LOCAL_PASSWORD_URI in raw_message.decode(
+                        "latin-1", errors="ignore"
+                    ):
+                        response = bytearray(raw_message)
+                    elif response:
+                        response.extend(raw_message)
+                    else:
+                        continue
+
+                    if len(response) > _LOCAL_PASSWORD_MAX_RESPONSE_BYTES:
+                        break
+                    password = cls._extract_local_gateway_password(bytes(response))
+                    if password is not None:
+                        return password
+        except (TimeoutError, aiohttp.ClientError, socket.gaierror) as err:
+            raise TydomLocalPasswordPairingError(
+                "The local button pairing window is not available"
+            ) from err
+        finally:
+            if connection is not None:
+                await connection.close()
+
+        raise TydomLocalPasswordPairingError(
+            "The gateway did not return a local password during the pairing window"
+        )
+
     async def async_connect(self) -> ClientWebSocketResponse:
         """Connect to the Tydom API."""
         global file_lines, file_mode, file_name
@@ -348,6 +511,10 @@ class TydomClient:
                     '.*nonce="([a-zA-Z0-9+=]+)".*',
                     www_authenticate,
                 )
+                realm_matcher = re.match(
+                    r'.*realm="([^"]+)".*',
+                    www_authenticate,
+                )
                 response.close()
 
                 if re_matcher:
@@ -356,7 +523,10 @@ class TydomClient:
                     raise TydomClientApiClientError("Could't find auth nonce")
 
                 ws_headers = {
-                    "Authorization": self.build_digest_headers(re_matcher.group(1))
+                    "Authorization": self.build_digest_headers(
+                        re_matcher.group(1),
+                        realm_matcher.group(1) if realm_matcher else None,
+                    )
                 }
 
             connection = await session.ws_connect(
@@ -686,12 +856,12 @@ class TydomClient:
         """Handle a pong response and keep the pending ping counter non-negative."""
         self.pending_pings = max(0, self.pending_pings - 1)
 
-    def build_digest_headers(self, nonce):
+    def build_digest_headers(self, nonce, realm=None):
         """Build the headers of Digest Authentication."""
         digest_auth = HTTPDigestAuth(self._mac, self._password)
         chal = {}
         chal["nonce"] = nonce
-        chal["realm"] = (
+        chal["realm"] = realm or (
             "ServiceMedia" if self._remote_mode is True else "protected area"
         )
         chal["qop"] = "auth"
@@ -853,6 +1023,7 @@ class TydomClient:
         body: dict | bytes | None = None,
         headers: dict | None = None,
         timeout: float = TIMEOUT_NORMAL_REQUEST,
+        log_timeout: bool = True,
     ) -> list[dict] | None:
         """Send request and wait for its reply with timeout handling.
 
@@ -862,6 +1033,7 @@ class TydomClient:
             body: Request body
             headers: Request headers
             timeout: Timeout in seconds (default: 30.0)
+            log_timeout: Log an expected timeout as a warning when true.
 
         Returns:
             List of reply events or None
@@ -899,7 +1071,8 @@ class TydomClient:
             async with async_timeout.timeout(timeout):
                 await event.wait()
         except TimeoutError:
-            LOGGER.warning(
+            log_method = LOGGER.warning if log_timeout else LOGGER.debug
+            log_method(
                 "Timeout waiting for reply to %s %s (transaction_id: %s, timeout: %.1fs)",
                 method,
                 safe_url,
@@ -947,6 +1120,124 @@ class TydomClient:
         msg_type = "/info"
         req = "GET"
         await self.send_message(method=req, msg=msg_type)
+
+    async def post_device_discovery(self, payload: dict[str, str | int]) -> None:
+        """Start the gateway's generic product-discovery workflow.
+
+        The official TYDOM application sends its standard ``DISCOVER``
+        request to ``/devices/install``, independently of the selected radio
+        profile. Some gateway firmware retains the former ``/devices``
+        action. Probe the official route first and use that compatibility
+        route only after an explicit HTTP 404; a scan timeout means the
+        gateway is listening and must not trigger a second request.
+        """
+        required = {"protocol", "type", "profile"}
+        missing = required.difference(payload)
+        if missing:
+            raise ValueError(
+                "Product association payload is missing: " + ", ".join(sorted(missing))
+            )
+        endpoint = self._device_discovery_endpoint
+        if endpoint == "/devices":
+            transaction_id = await self.send_request("POST", endpoint, body=payload)
+            LOGGER.debug(
+                "Dispatched compatibility product-association request "
+                "(transaction_id: %s)",
+                transaction_id,
+            )
+            return
+
+        try:
+            await self.get_reply_to_request(
+                "POST",
+                endpoint,
+                body=payload,
+                timeout=1,
+                log_timeout=False,
+            )
+        except TydomClientApiClientCommunicationError as err:
+            error = str(err)
+            if "Timeout waiting for reply" in error:
+                LOGGER.debug(
+                    "Product-association request dispatched; gateway is listening: %s",
+                    error,
+                )
+                return
+            if "HTTP 404" not in error:
+                raise
+
+            self._device_discovery_endpoint = "/devices"
+            transaction_id = await self.send_request("POST", "/devices", body=payload)
+            LOGGER.info(
+                "Gateway does not support %s; dispatched compatibility "
+                "product-association request (transaction_id: %s)",
+                endpoint,
+                transaction_id,
+            )
+            return
+
+        LOGGER.debug(
+            "Gateway acknowledged product-association request on %s",
+            endpoint,
+        )
+
+    async def delete_device(self, device_id: str | int) -> None:
+        """Permanently delete one complete product from the TYDOM inventory.
+
+        This deliberately targets the parent device, not one of its endpoints.
+        A product such as a TYXIA 2600 can expose an endpoint per physical
+        button; deleting an endpoint merely removes that button and leaves the
+        product shell in the gateway inventory. The official product-removal
+        workflow uses the device route for a complete disassociation.
+        """
+        safe_device_id = quote(str(device_id), safe="")
+        await self.get_reply_to_request("DELETE", f"/devices/{safe_device_id}")
+
+    async def delete_group(self, group_id: str | int) -> None:
+        """Delete one dedicated TYDOM configuration group."""
+        safe_group_id = quote(str(group_id), safe="")
+        await self.get_reply_to_request("DELETE", f"/groups/{safe_group_id}")
+
+    @staticmethod
+    def _file_reply_document(reply: list[dict] | None, path: str) -> dict[str, object]:
+        """Return the single JSON document returned by a TYDOM file endpoint."""
+        if not reply or not isinstance(reply[0], dict):
+            raise TydomClientApiClientCommunicationError(
+                f"TYDOM returned no JSON document for {path}"
+            )
+        return copy.deepcopy(reply[0])
+
+    async def get_config_file_document(self) -> dict[str, object]:
+        """Read a fresh complete ``/configs/file`` document."""
+        return self._file_reply_document(
+            await self.get_reply_to_request("GET", "/configs/file"),
+            "/configs/file",
+        )
+
+    async def get_groups_file_document(self) -> dict[str, object]:
+        """Read a fresh complete ``/groups/file`` document."""
+        return self._file_reply_document(
+            await self.get_reply_to_request("GET", "/groups/file"),
+            "/groups/file",
+        )
+
+    async def post_config_file_document(self, document: dict[str, object]) -> None:
+        """Replace the gateway configuration document with a validated snapshot."""
+        await self.get_reply_to_request("POST", "/configs/file", body=document)
+
+    async def post_groups_file_document(self, document: dict[str, object]) -> None:
+        """Replace the gateway group-membership document with a validated snapshot."""
+        await self.get_reply_to_request("POST", "/groups/file", body=document)
+
+    async def delete_endpoint(
+        self, device_id: str | int, endpoint_id: str | int
+    ) -> None:
+        """Delete one endpoint only, without removing its parent product."""
+        safe_device_id = quote(str(device_id), safe="")
+        safe_endpoint_id = quote(str(endpoint_id), safe="")
+        await self.get_reply_to_request(
+            "DELETE", f"/devices/{safe_device_id}/endpoints/{safe_endpoint_id}"
+        )
 
     async def get_local_claim(self):
         """Ask some information from Tydom."""
@@ -1181,6 +1472,8 @@ class TydomClient:
     async def get_moments(self):
         """Get the moments (programs)."""
         msg_type = "/moments/file"
+        if msg_type in self._unsupported_optional_paths:
+            return
         req = "GET"
         await self.send_message(method=req, msg=msg_type)
 
@@ -1240,8 +1533,14 @@ class TydomClient:
     async def get_scenarii(self):
         """Get the scenarios."""
         msg_type = "/scenarios/file"
+        if msg_type in self._unsupported_optional_paths:
+            return
         req = "GET"
         await self.send_message(method=req, msg=msg_type)
+
+    def mark_optional_path_unsupported(self, path: str) -> None:
+        """Remember an optional API path rejected by this gateway."""
+        self._unsupported_optional_paths.add(path)
 
     async def activate_scenario(self, scenario_id: str | int):
         """Activate a scenario.
@@ -1373,7 +1672,20 @@ class TydomClient:
 
     async def put_area_data(self, area_id, name, value, max_retries: int = 2) -> int:
         """Set one attribute on an area-backed device."""
-        body = json.dumps([{"name": name, "value": value}])
+        return await self.put_area_data_attributes(
+            area_id, {name: value}, max_retries=max_retries
+        )
+
+    async def put_area_data_attributes(
+        self,
+        area_id,
+        attributes: dict,
+        max_retries: int = 2,
+    ) -> int:
+        """Set one or more attributes atomically on an area-backed device."""
+        body = json.dumps(
+            [{"name": name, "value": value} for name, value in attributes.items()]
+        )
         safe_area_id = quote(str(area_id), safe="")
         path = f"/areas/{safe_area_id}/data"
         str_request = (
@@ -1385,10 +1697,9 @@ class TydomClient:
         )
         a_bytes = self._cmd_prefix + bytes(str_request, "ascii")
         LOGGER.debug(
-            "Sending area command: area_id=%s, name=%s, value=%s",
+            "Sending area command: area_id=%s, attributes=%s",
             area_id,
-            name,
-            value,
+            list(attributes),
         )
         if not file_mode:
             await self.send_bytes(a_bytes, max_retries=max_retries)
@@ -1464,19 +1775,23 @@ class TydomClient:
         value=None,
         zone_id=None,
         legacy_zones=False,
-    ):
-        """Configure alarm mode."""
+    ) -> bool:
+        """Configure alarm mode and report whether the result was confirmed."""
         if legacy_zones and zone_id not in (None, ""):
             zones_array = str(zone_id).split(",")
+            confirmed = True
             for zone in zones_array:
-                await self._put_alarm_cdata(
-                    device_id, endpoint_id, alarm_pin, value, zone, legacy_zones
+                confirmed = (
+                    await self._put_alarm_cdata(
+                        device_id, endpoint_id, alarm_pin, value, zone, legacy_zones
+                    )
+                    and confirmed
                 )
-            return
+            return confirmed
 
         # Global legacy commands such as disarm have no zone. They still use
         # alarmCmd and must not be dropped by the legacy zone dispatcher.
-        await self._put_alarm_cdata(
+        return await self._put_alarm_cdata(
             device_id, endpoint_id, alarm_pin, value, zone_id, legacy_zones
         )
 
@@ -1488,8 +1803,13 @@ class TydomClient:
         value=None,
         zone_id=None,
         legacy_zones=False,
-    ):
-        """Configure alarm mode."""
+    ) -> bool:
+        """Configure alarm mode and await its asynchronous result.
+
+        ``False`` means the gateway did not publish an outcome. Older
+        gateways can still execute the command in that case, so callers must
+        not report a failure but also must not treat it as confirmed.
+        """
         # Credits to @mgcrea on github !
         # AWAY # "PUT /devices/{}/endpoints/{}/cdata?name=alarmCmd HTTP/1.1\r\ncontent-length: 29\r\ncontent-type: application/json; charset=utf-8\r\ntransac-id: request_124\r\n\r\n\r\n{"value":"ON","pwd":{}}\r\n\r\n"
         # HOME "PUT /devices/{}/endpoints/{}/cdata?name=zoneCmd HTTP/1.1\r\ncontent-length: 41\r\ncontent-type: application/json; charset=utf-8\r\ntransac-id: request_46\r\n\r\n\r\n{"value":"ON","pwd":"{}","zones":[1]}\r\n\r\n"
@@ -1516,55 +1836,56 @@ class TydomClient:
         else:
             pin = alarm_pin
 
-        try:
-            if zone_id is None or zone_id == "":
-                cmd = "alarmCmd"
-                body = json.dumps({"value": str(value), "pwd": str(pin)})
-            else:
-                if legacy_zones:
-                    cmd = "partCmd"
-                    body = json.dumps({"value": str(value), "part": str(zone_id)})
-                else:
-                    cmd = "zoneCmd"
-                    zones = [
-                        int(zone.strip())
-                        for zone in str(zone_id).split(",")
-                        if zone.strip()
-                    ]
-                    body = json.dumps(
-                        {"value": str(value), "pwd": str(pin), "zones": zones}
-                    )
+        if zone_id is None or zone_id == "":
+            cmd = "alarmCmd"
+            body = {"value": str(value), "pwd": str(pin)}
+        elif legacy_zones:
+            cmd = "partCmd"
+            body = {"value": str(value), "part": str(zone_id)}
+        else:
+            cmd = "zoneCmd"
+            zones = [
+                int(zone.strip()) for zone in str(zone_id).split(",") if zone.strip()
+            ]
+            body = {"value": str(value), "pwd": str(pin), "zones": zones}
 
-            safe_device_id = quote(str(device_id), safe="")
-            safe_endpoint_id = quote(str(endpoint_id), safe="")
-            safe_cmd = quote(str(cmd), safe="")
-            str_request = (
-                f"PUT /devices/{safe_device_id}/endpoints/{safe_endpoint_id}/cdata?name={safe_cmd} HTTP/1.1\r\nContent-Length: "
-                + str(len(body))
-                + "\r\nContent-Type: application/json; charset=UTF-8\r\nTransac-Id: 0\r\n\r\n"
-                + body
-                + "\r\n\r\n"
+        body_json = json.dumps(body)
+        safe_device_id = quote(str(device_id), safe="")
+        safe_endpoint_id = quote(str(endpoint_id), safe="")
+        safe_cmd = quote(cmd, safe="")
+        request = (
+            f"PUT /devices/{safe_device_id}/endpoints/{safe_endpoint_id}/cdata"
+            f"?name={safe_cmd} HTTP/1.1\r\nContent-Length: {len(body_json)}"
+            "\r\nContent-Type: application/json; charset=UTF-8"
+            "\r\nTransac-Id: 0\r\n\r\n"
+            f"{body_json}\r\n\r\n"
+        )
+        waiter = self._message_handler.create_alarm_command_waiter(
+            str(device_id), str(endpoint_id), cmd
+        )
+        try:
+            if not file_mode:
+                await self.send_bytes(self._cmd_prefix + request.encode("ascii"))
+            try:
+                async with async_timeout.timeout(5):
+                    reply = await waiter
+            except TimeoutError:
+                # Older gateways may execute alarm commands without publishing
+                # a command result. Preserve that established fire-and-forget
+                # behaviour rather than turning a successful command into an
+                # apparent Home Assistant failure. Retain the uncertainty for
+                # callers that need to react to a refused arm command.
+                LOGGER.debug("No asynchronous result received for %s", cmd)
+                return False
+        finally:
+            self._message_handler.remove_alarm_command_waiter(
+                str(device_id), str(endpoint_id), cmd, waiter
             )
 
-            a_bytes = self._cmd_prefix + bytes(str_request, "ascii")
-            LOGGER.debug("Sending message to tydom (%s)", "PUT cdata")
-
-            try:
-                if not file_mode:
-                    await self.send_bytes(a_bytes)
-                    return 0
-            except BaseException:
-                LOGGER.error("put_alarm_cdata ERROR !", exc_info=True)
-                # Masquer les informations sensibles dans les bytes loggés
-                a_bytes_str = (
-                    a_bytes.decode("utf-8", errors="replace")
-                    if isinstance(a_bytes, bytes)
-                    else str(a_bytes)
-                )
-                sanitized_bytes = sanitize_log_message(a_bytes_str, self._password)
-                LOGGER.error("Request bytes: %s", sanitized_bytes)
-        except BaseException:
-            LOGGER.error("put_alarm_cdata ERROR !", exc_info=True)
+        result = str(reply.get("values", {}).get("result"))
+        if result != "ACK":
+            raise TydomAlarmCommandError(cmd, result)
+        return True
 
     async def put_ackevents_cdata(self, device_id, endpoint_id=None, alarm_pin=None):
         """Acknowledge alarm events using the command supported by the gateway.
@@ -1581,19 +1902,41 @@ class TydomClient:
         pin = alarm_pin or self._alarm_pin
 
         if pin:
+            # TYDOM2 publishes the command outcome asynchronously with the
+            # reserved transaction id 0, just like arm commands.  Waiting for
+            # a transaction-correlated HTTP reply causes a 30-second timeout.
+            body = json.dumps({"pwd": str(pin)})
+            request = (
+                f"PUT /devices/{safe_device_id}/endpoints/{safe_endpoint_id}/cdata"
+                "?name=ackEventCmd HTTP/1.1\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Content-Type: application/json; charset=UTF-8\r\n"
+                "Transac-Id: 0\r\n\r\n"
+                f"{body}\r\n\r\n"
+            )
+            waiter = self._message_handler.create_alarm_command_waiter(
+                str(device_id), str(endpoint_id), "ackEventCmd"
+            )
             try:
-                await self.get_reply_to_request(
-                    "PUT",
-                    f"/devices/{safe_device_id}/endpoints/{safe_endpoint_id}/cdata"
-                    "?name=ackEventCmd",
-                    body={"pwd": str(pin)},
+                await self.send_bytes(self._cmd_prefix + request.encode("ascii"))
+                try:
+                    async with async_timeout.timeout(5):
+                        reply = await waiter
+                except TimeoutError:
+                    # Older gateways may not publish a result.  Do not send
+                    # the /data fallback: its empty 200 is only transport ACK
+                    # and does not prove that the central unit executed it.
+                    LOGGER.debug("No asynchronous result received for ackEventCmd")
+                    return
+            finally:
+                self._message_handler.remove_alarm_command_waiter(
+                    str(device_id), str(endpoint_id), "ackEventCmd", waiter
                 )
-                return
-            except TydomClientApiClientCommunicationError:
-                LOGGER.debug(
-                    "Authenticated TYXAL acknowledgement was rejected; "
-                    "trying the data-channel form"
-                )
+
+            result = str(reply.get("values", {}).get("result"))
+            if result != "ACK":
+                raise TydomAlarmCommandError("ackEventCmd", result)
+            return
 
         await self.put_devices_data(device_id, endpoint_id, "ackEventCmd", "ACK")
 
@@ -1604,6 +1947,9 @@ class TydomClient:
         event_type: str | None = None,
         indexStart: int = 0,
         nbElement: int = 10,
+        *,
+        timeout: float = TIMEOUT_LONG_REQUEST,
+        log_timeout: bool = True,
     ) -> list[dict] | None:
         """Get historical events."""
         # GET /devices/xxxx/endpoints/xxxx/cdata?name=histo&type=ALL&indexStart=0&nbElem=10
@@ -1615,7 +1961,9 @@ class TydomClient:
         # The box streams the events one message at a time (about 2 seconds
         # apart), so the reply wait needs the long timeout; the default one
         # (10 s) cuts the stream off after a few events.
-        return await self.get_reply_to_request("GET", url, timeout=TIMEOUT_LONG_REQUEST)
+        return await self.get_reply_to_request(
+            "GET", url, timeout=timeout, log_timeout=log_timeout
+        )
 
     @staticmethod
     def _first_cdata_value(messages: list[dict] | None) -> dict | None:

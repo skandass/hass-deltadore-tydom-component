@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import copy
 import json
 import re
 import time
@@ -59,6 +60,12 @@ if TYPE_CHECKING:
 
 _MAX_REPLIES_SIZE = 5
 """Maximal number of replies to keep track of."""
+
+_ENDPOINT_WARNING_MILESTONES = {1, 10, 100, 1000}
+"""Per-session endpoint issue counts which remain visible as warnings."""
+
+_OPTIONAL_PATHS = frozenset({"/moments/file", "/scenarios/file"})
+"""Feature endpoints absent from some older TYDOM gateway firmware."""
 
 _HISTO_END_INDEX = 255
 """Index value (0xFF) of the sentinel element closing an histo reply stream.
@@ -133,11 +140,128 @@ def _is_tyxia_4910_other(uid: str) -> bool:
     return is_binary_tyxia_receiver_profile(device_metadata.get(uid))
 
 
+def _is_unconfigured_x3d_remote(uid: str, endpoint: dict[str, Any]) -> bool:
+    """Return whether an endpoint is a radio remote without TYDOM config data.
+
+    A freshly discovered X3D remote is not returned in ``/configs/file`` on
+    some TYDOM gateways. Its metadata is nevertheless distinctive: the only
+    usable state is an action with REMOTE validity. Keeping it visible allows
+    the user to receive button events and to remove the radio association from
+    Home Assistant.
+    """
+    action_metadata = device_metadata.get(uid, {}).get("action", {})
+    if action_metadata.get("validity") != "REMOTE":
+        return False
+
+    data = endpoint.get("data", [])
+    return any(
+        item.get("name") == "action" and item.get("validity") == "upToDate"
+        for item in data
+        if isinstance(item, dict)
+    )
+
+
+def _has_configured_remote_button(device_id: str | int) -> bool:
+    """Return whether one button of this physical remote is configured.
+
+    TYDOM continues to report every radio endpoint of a remote after a single
+    button is removed from ``/configs/file``. Those endpoints must not become
+    a second generic unconfigured remote: configured sibling buttons already
+    represent the physical product.
+    """
+    physical_device_id = str(device_id)
+    return any(
+        str(config.get("device_id")) == physical_device_id
+        and config.get("usage") == "remoteControl"
+        for config in endpoint_config.values()
+    )
+
+
+def _has_configured_interrupter_button(device_id: str | int) -> bool:
+    """Return whether one button of this physical wall switch is configured."""
+    physical_device_id = str(device_id)
+    return any(
+        str(config.get("device_id")) == physical_device_id
+        for config in interrupter_endpoint_config.values()
+    )
+
+
+def _has_current_action(endpoint: dict[str, Any]) -> bool:
+    """Return whether an endpoint currently exposes a usable radio action."""
+    return any(
+        item.get("name") == "action" and item.get("validity") == "upToDate"
+        for item in endpoint.get("data", [])
+        if isinstance(item, dict)
+    )
+
+
+def _action_from_endpoint(endpoint: dict[str, Any]) -> str:
+    """Extract the non-idle action emitted by a newly discovered endpoint."""
+    return next(
+        (
+            str(item.get("value"))
+            for item in endpoint.get("data", [])
+            if isinstance(item, dict)
+            and item.get("name") == "action"
+            and item.get("value") != "IDLE"
+        ),
+        "TOGGLE",
+    )
+
+
+def _sibling_info(
+    info_by_endpoint: dict[str, dict[str, Any]], device_id: str | int
+) -> dict[str, Any]:
+    """Copy physical-product information from any configured sibling endpoint."""
+    physical_device_id = str(device_id)
+    return next(
+        (
+            info.copy()
+            for info in info_by_endpoint.values()
+            if str(info.get("physical_device_id")) == physical_device_id
+        ),
+        {},
+    )
+
+
+def _unconfigured_x3d_product(
+    endpoint: dict[str, Any], device_id: str | int
+) -> tuple[str, str] | None:
+    """Return a safe fallback type/name for a newly discovered X3D product.
+
+    Some older gateways announce a successful product association through
+    ``POST /devices/access`` before, or instead of, adding the product to
+    ``/configs/file``. The access event contains the radio profile, which is
+    enough to expose the two non-ambiguous products currently supported here.
+    A previously associated Tywatt has no later access event, but its
+    ``energyIndexHeatGas`` state is likewise unambiguous. Persisting the
+    inferred mapping lets the following ``/devices/meta`` and ``/devices/data``
+    events create the normal HA entities.
+    """
+    access = endpoint.get("access")
+    profiles = {
+        "meter": ("conso", f"X3D meter {device_id}"),
+        "temperature": ("sensorThermo", f"X3D temperature sensor {device_id}"),
+    }
+    if isinstance(access, dict) and access.get("protocol") == "X3D":
+        return profiles.get(access.get("profile"))
+
+    data_names = {
+        item.get("name")
+        for item in endpoint.get("data", [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    if "energyIndexHeatGas" in data_names:
+        return profiles["meter"]
+    return None
+
+
 # Device dict for parsing
 device_name = {}
 device_endpoint = {}
 device_type = {}
 device_metadata = {}
+device_command_metadata = {}
 device_tutorial_id = {}
 interrupter_endpoint_config = {}
 interrupter_info = {}
@@ -146,6 +270,11 @@ groups_metadata = {}  # Store group metadata from /configs/file: {group_id: {"us
 groups_data = {}  # Store groups data: {group_id: {"devices": [device_ids], "name": group_name}}
 endpoint_config = {}  # Store endpoint-specific configuration from /configs/file
 remote_control_info = {}  # Store physical remote and button details by endpoint UID
+# Complete file snapshots are required when the gateway configuration must be
+# updated.  The normal lookup dictionaries above intentionally retain only the
+# fields used to create HA entities and cannot safely be written back.
+config_file_data: dict[str, Any] | None = None
+groups_file_data: dict[str, Any] | None = None
 
 SUPPORTED_CONTROL_GROUP_USAGES = {"awning", "light", "plug", "shutter"}
 TOTAL_GROUP_NAMES = {
@@ -316,8 +445,12 @@ class Reply(TypedDict):
 
 def _interrupter_model(tutorial_id: str) -> str:
     """Return a friendly wall-switch model from its tutorial identifier."""
+    if tutorial_id.startswith("switch_tyxia2310"):
+        return "TYXIA 2310"
     if tutorial_id.startswith("switch_tyxia2600"):
         return "TYXIA 2600"
+    if tutorial_id.startswith("switch_tyxia2700"):
+        return "TYXIA 2700"
     return "Delta Dore wall switch"
 
 
@@ -418,9 +551,42 @@ class MessageHandler:
         self._cdata_replies: list[Reply] = []
         self._end_reply_events: dict[str, asyncio.Event] = {}
         self._reply_errors: dict[str, str] = {}
+        self._alarm_command_waiters: dict[
+            tuple[str, str, str], list[asyncio.Future[dict[str, Any]]]
+        ] = {}
         self._area_devices: dict[str, dict[str, AreaDeviceReference]] = {}
         self._area_data: dict[str, dict[str, Any]] = {}
         self._area_metadata: dict[str, dict] = {}
+        self._endpoint_issue_counts: dict[tuple[Any, Any, str, Any], int] = {}
+
+    def _record_endpoint_issue(
+        self,
+        device_id: Any,
+        endpoint_id: Any,
+        issue: str,
+        detail: Any,
+        name: str,
+    ) -> None:
+        """Rate-limit a repeated endpoint problem while retaining diagnostics."""
+        key = (device_id, endpoint_id, issue, detail)
+        occurrences = self._endpoint_issue_counts.get(key, 0) + 1
+        self._endpoint_issue_counts[key] = occurrences
+
+        log = (
+            LOGGER.warning
+            if occurrences in _ENDPOINT_WARNING_MILESTONES
+            else LOGGER.debug
+        )
+        log(
+            "TYDOM endpoint %s: device_id=%s, endpoint_id=%s, name=%s, "
+            "detail=%s, occurrences=%s; retaining the previous state",
+            issue,
+            device_id,
+            endpoint_id,
+            name,
+            detail,
+            occurrences,
+        )
 
     def get_reply(self, transaction_id: str) -> Reply | None:
         """
@@ -479,10 +645,67 @@ class MessageHandler:
         """Return and forget a protocol error for one pending request."""
         return self._reply_errors.pop(transaction_id, None)
 
+    def create_alarm_command_waiter(
+        self, device_id: str, endpoint_id: str, command: str
+    ) -> asyncio.Future[dict[str, Any]]:
+        """Wait for an asynchronous alarm command result broadcast by TYDOM."""
+        key = (str(device_id), str(endpoint_id), command)
+        waiter = asyncio.get_running_loop().create_future()
+        self._alarm_command_waiters.setdefault(key, []).append(waiter)
+        return waiter
+
+    def remove_alarm_command_waiter(
+        self,
+        device_id: str,
+        endpoint_id: str,
+        command: str,
+        waiter: asyncio.Future[dict[str, Any]],
+    ) -> None:
+        """Remove one alarm command waiter after completion or timeout."""
+        key = (str(device_id), str(endpoint_id), command)
+        waiters = self._alarm_command_waiters.get(key)
+        if not waiters:
+            return
+        with contextlib.suppress(ValueError):
+            waiters.remove(waiter)
+        if not waiters:
+            self._alarm_command_waiters.pop(key, None)
+
+    def _resolve_alarm_command_waiter(
+        self, device_id: str, endpoint_id: str, element: dict[str, Any]
+    ) -> None:
+        """Deliver a Transac-Id 0 alarm result to the command that sent it."""
+        command = element.get("name")
+        if not command or (element.get("values") or {}).get("result") is None:
+            return
+        key = (str(device_id), str(endpoint_id), command)
+        waiters = self._alarm_command_waiters.get(key)
+        while waiters:
+            waiter = waiters.pop(0)
+            if not waiter.done():
+                waiter.set_result(element)
+                break
+        if not waiters:
+            self._alarm_command_waiters.pop(key, None)
+
     def _complete_empty_cdata_reply(self, transaction_id: str) -> None:
         """Complete an EOR-only reply unless late TYXAL data completed it first."""
         if event := self._end_reply_events.pop(transaction_id, None):
             event.set()
+
+    def _complete_empty_reply(self, transaction_id: str) -> None:
+        """Complete a tracked request acknowledged without a response body."""
+        event = self._end_reply_events.pop(transaction_id, None)
+        if event is None:
+            return
+
+        self._cdata_replies.insert(
+            0,
+            Reply(transaction_id=transaction_id, events=[], done=True),
+        )
+        if len(self._cdata_replies) > _MAX_REPLIES_SIZE:
+            self._cdata_replies.pop()
+        event.set()
 
     async def route_response(self, bytes_str: bytes) -> list["TydomDevice"] | None:
         """
@@ -512,6 +735,13 @@ class MessageHandler:
             transaction_id = parsed_message.headers.get("Transac-Id")
 
             if status is not None and status >= 400:
+                if status == 404 and uri_origin in _OPTIONAL_PATHS:
+                    self.tydom_client.mark_optional_path_unsupported(uri_origin)
+                    LOGGER.debug(
+                        "TYDOM gateway does not support optional endpoint %s",
+                        uri_origin,
+                    )
+                    return None
                 # The box rejected the request; surface the error body (an
                 # HTML page naming the cause) instead of dropping it in the
                 # html no-op, and resolve any pending reply right away
@@ -555,15 +785,36 @@ class MessageHandler:
                     transaction_id,
                     uri_origin,
                 )
+                if transaction_id:
+                    self._complete_empty_reply(transaction_id)
                 return None
 
             try:
-                return await self.parse_response(
+                devices = await self.parse_response(
                     parsed_message.body,
                     uri_origin,
                     parsed_message.headers.get("content-type"),
                     transaction_id=transaction_id if transaction_id else None,
                 )
+                # Most configuration endpoints respond with one JSON document,
+                # not with cdata.  Preserve that document for callers which
+                # deliberately wait for a fresh file before modifying it.
+                # cdata requests complete themselves in parse_devices_cdata.
+                if transaction_id and transaction_id in self._end_reply_events:
+                    event = self._end_reply_events.pop(transaction_id)
+                    parsed: Any = parsed_message.body
+                    with contextlib.suppress(json.decoder.JSONDecodeError):
+                        parsed = json.loads(parsed_message.body or b"null")
+                    self._cdata_replies.insert(
+                        0,
+                        Reply(
+                            transaction_id=transaction_id, events=[parsed], done=True
+                        ),
+                    )
+                    if len(self._cdata_replies) > _MAX_REPLIES_SIZE:
+                        self._cdata_replies.pop()
+                    event.set()
+                return devices
             except BaseException as e:
                 LOGGER.error(
                     "Error when parsing tydom message (%s)", bytes_str, exc_info=e
@@ -666,9 +917,10 @@ class MessageHandler:
             "/areas/data": self.parse_areas_data,
             "/configs/file": MessageHandler.parse_config_data,
             "/configs/gateway/api_mode": partial(no_op, "msg_api_mode"),
+            "/devices/data": self.parse_devices_data,
             "/devices/cdata": self.parse_devices_cdata,
             "/devices/cmeta": self.parse_cmeta_data,
-            "/devices/install": partial(no_op, "msg_pairing"),
+            "/devices": partial(no_op, "msg_pairing"),
             "/devices/meta": self.parse_devices_metadata,
             "/events": event_message,
             "/groups/file": self.parse_groups_file,
@@ -966,6 +1218,7 @@ class MessageHandler:
                     endpoint,
                     device_metadata.get(uid),
                     data,
+                    command_metadata=device_command_metadata.get(uid),
                 )
             case "weather":
                 weather_device = TydomWeather(
@@ -1082,7 +1335,25 @@ class MessageHandler:
     @staticmethod
     async def parse_config_data(parsed, transaction_id):
         """Parse config data."""
+        global config_file_data
         LOGGER.debug("parse_config_data : %s", parsed)
+        if not isinstance(parsed, dict):
+            LOGGER.warning("Ignoring malformed /configs/file response: %s", parsed)
+            return []
+        config_file_data = copy.deepcopy(parsed)
+
+        # ``/configs/file`` is a complete snapshot. Remove mappings derived
+        # from its previous version before rebuilding them, otherwise a button
+        # removed from the gateway configuration keeps its old name/type and is
+        # recreated during the following device-data refresh.
+        previous_configured_uids = set(endpoint_config)
+        for unique_id in previous_configured_uids:
+            device_name.pop(unique_id, None)
+            device_type.pop(unique_id, None)
+            device_endpoint.pop(unique_id, None)
+            device_tutorial_id.pop(unique_id, None)
+            interrupter_endpoint_config.pop(unique_id, None)
+        endpoint_config.clear()
         for i in parsed["endpoints"]:
             device_unique_id = str(i["id_endpoint"]) + "_" + str(i["id_device"])
 
@@ -1188,8 +1459,15 @@ class MessageHandler:
         LOGGER.debug("parse_cmeta_data : %s", parsed)
         for i in parsed:
             for endpoint in i["endpoints"]:
-                if len(endpoint["cmetadata"]) > 0:
-                    for elem in endpoint["cmetadata"]:
+                command_metadata = endpoint.get("cmetadata", [])
+                unique_id = f"{endpoint['id']}_{i['id']}"
+                device_command_metadata[unique_id] = {
+                    elem["name"]: elem
+                    for elem in command_metadata
+                    if isinstance(elem, dict) and elem.get("name")
+                }
+                if len(command_metadata) > 0:
+                    for elem in command_metadata:
                         if elem["name"] == "energyIndex":
                             for params in elem["parameters"]:
                                 if params["name"] == "dest":
@@ -1286,6 +1564,37 @@ class MessageHandler:
                 for endpoint in i["endpoints"]:
                     endpoint_id = endpoint["id"]
                     unique_id = str(endpoint_id) + "_" + str(device_id)
+                    known_pending_endpoints = getattr(
+                        self.tydom_client,
+                        "_configless_remote_known_endpoint_ids",
+                        set(),
+                    )
+                    generic_pending_endpoints = getattr(
+                        self.tydom_client,
+                        "_configless_remote_generic_endpoint_ids",
+                        set(),
+                    )
+                    allow_pending_remote_discovery = getattr(
+                        self.tydom_client,
+                        "_allow_configless_remote_discovery",
+                        False,
+                    ) and (
+                        unique_id not in known_pending_endpoints
+                        or unique_id in generic_pending_endpoints
+                    )
+                    known_pending_standalone_device_ids = getattr(
+                        self.tydom_client,
+                        "_configless_standalone_known_device_ids",
+                        set(),
+                    )
+                    allow_pending_standalone_discovery = (
+                        getattr(
+                            self.tydom_client,
+                            "_allow_configless_standalone_discovery",
+                            False,
+                        )
+                        and str(device_id) not in known_pending_standalone_device_ids
+                    )
 
                     # Check for collisions
                     if unique_id in seen_unique_ids:
@@ -1303,6 +1612,165 @@ class MessageHandler:
                     # Get device name and type first to check if device is registered
                     name_of_id = self.get_name_from_id(unique_id)
                     type_of_id = self.get_type_from_id(unique_id)
+
+                    # A partially associated multi-button product is retained by
+                    # TYDOM as an ``unknown`` "Produit N" configuration entry.
+                    # It is not a new generic device: another configured endpoint
+                    # of the same physical product identifies its family.  Restore
+                    # the temporary endpoint to that family so Hub can finish the
+                    # association and add it to the existing related-endpoint
+                    # group.  Without this, the finalisation is never reached and
+                    # the TYDOM application leaves the product under Non gere.
+                    if (
+                        config_file_data is not None
+                        and type_of_id == "unknown"
+                        and _has_current_action(endpoint)
+                        and _has_configured_remote_button(device_id)
+                    ):
+                        name_of_id = f"X3D remote control {device_id}"
+                        type_of_id = "remoteControl"
+                        device_name[unique_id] = name_of_id
+                        device_type[unique_id] = type_of_id
+                        remote_info = _sibling_info(remote_control_info, device_id)
+                        remote_info.update(
+                            {
+                                "physical_device_id": str(device_id),
+                                "button_number": None,
+                                "configured_action": _action_from_endpoint(endpoint),
+                            }
+                        )
+                        remote_control_info[unique_id] = remote_info
+                        LOGGER.info(
+                            "Restored pending X3D remote endpoint "
+                            "(device_id=%s, endpoint_id=%s)",
+                            device_id,
+                            endpoint_id,
+                        )
+                    elif (
+                        config_file_data is not None
+                        and type_of_id == "unknown"
+                        and _has_current_action(endpoint)
+                        and _has_configured_interrupter_button(device_id)
+                    ):
+                        name_of_id = f"X3D wall switch {device_id}"
+                        type_of_id = "interrupter"
+                        device_name[unique_id] = name_of_id
+                        device_type[unique_id] = type_of_id
+                        interrupter_details = _sibling_info(interrupter_info, device_id)
+                        interrupter_details.update(
+                            {
+                                "physical_device_id": str(device_id),
+                                "button": None,
+                                "configured_action": _action_from_endpoint(endpoint),
+                            }
+                        )
+                        interrupter_info[unique_id] = interrupter_details
+                        LOGGER.info(
+                            "Restored pending X3D wall-switch endpoint "
+                            "(device_id=%s, endpoint_id=%s)",
+                            device_id,
+                            endpoint_id,
+                        )
+                    elif (
+                        config_file_data is not None
+                        and type_of_id == "unknown"
+                        and _has_current_action(endpoint)
+                        and allow_pending_remote_discovery
+                    ):
+                        name_of_id = f"X3D remote control {device_id}"
+                        type_of_id = "remoteControl"
+                        device_name[unique_id] = name_of_id
+                        device_type[unique_id] = type_of_id
+                        remote_control_info[unique_id] = {
+                            "physical_device_id": str(device_id),
+                            "name": name_of_id,
+                            "model": "Delta Dore X3D remote control",
+                            "button_number": 1,
+                            "configured_action": _action_from_endpoint(endpoint),
+                        }
+                        LOGGER.info(
+                            "Recovered pending standalone X3D remote endpoint "
+                            "(device_id=%s, endpoint_id=%s)",
+                            device_id,
+                            endpoint_id,
+                        )
+
+                    if (
+                        # Wait for /configs/file before treating an unknown
+                        # endpoint as a generic remote.  During startup the
+                        # data reply can arrive first; creating the fallback
+                        # object then prevents a subsequently configured
+                        # TYXIA 2600 button from becoming an interrupter.
+                        config_file_data is not None
+                        and (not name_of_id or not type_of_id)
+                        and _is_unconfigured_x3d_remote(unique_id, endpoint)
+                        and (
+                            not _has_configured_remote_button(device_id)
+                            or allow_pending_remote_discovery
+                        )
+                    ):
+                        name_of_id = f"X3D remote control {device_id}"
+                        type_of_id = "remoteControl"
+                        device_name[unique_id] = name_of_id
+                        device_type[unique_id] = type_of_id
+                        remote_control_info.setdefault(
+                            unique_id,
+                            {
+                                "physical_device_id": str(device_id),
+                                "name": name_of_id,
+                                "model": "Delta Dore X3D remote control",
+                                "button_number": 1,
+                                "configured_action": _action_from_endpoint(endpoint),
+                            },
+                        )
+                        LOGGER.info(
+                            "Discovered unconfigured X3D remote endpoint "
+                            "(device_id=%s, endpoint_id=%s)",
+                            device_id,
+                            endpoint_id,
+                        )
+
+                    if (
+                        config_file_data is not None
+                        and (not name_of_id or not type_of_id)
+                        and (
+                            discovered_product := _unconfigured_x3d_product(
+                                endpoint, device_id
+                            )
+                        )
+                        is not None
+                    ):
+                        type_of_id, name_of_id = discovered_product
+                        device_name[unique_id] = name_of_id
+                        device_type[unique_id] = type_of_id
+                        LOGGER.info(
+                            "Discovered unconfigured X3D product "
+                            "(device_id=%s, endpoint_id=%s, type=%s)",
+                            device_id,
+                            endpoint_id,
+                            type_of_id,
+                        )
+
+                    if (
+                        config_file_data is not None
+                        and (not name_of_id or not type_of_id)
+                        and allow_pending_standalone_discovery
+                    ):
+                        # Not every gateway creates the normal empty
+                        # ``Produit N`` entry after a radio association.  The
+                        # Hub has an explicitly selected one-endpoint workflow
+                        # pending, so expose this new radio endpoint just long
+                        # enough for it to write the missing configuration.
+                        name_of_id = f"Produit {device_id}"
+                        type_of_id = "unknown"
+                        device_name[unique_id] = name_of_id
+                        device_type[unique_id] = type_of_id
+                        LOGGER.info(
+                            "Discovered configless standalone endpoint "
+                            "(device_id=%s, endpoint_id=%s)",
+                            device_id,
+                            endpoint_id,
+                        )
 
                     # Check if device is registered in configuration
                     if not name_of_id or name_of_id == "":
@@ -1329,6 +1797,12 @@ class MessageHandler:
                     # Check for errors or missing data, but still try to create device
                     has_error = endpoint.get("error", 0) != 0
                     has_data = "data" in endpoint and len(endpoint.get("data", [])) > 0
+                    valid_data = [
+                        elem
+                        for elem in endpoint.get("data", [])
+                        if elem.get("validity") == "upToDate"
+                    ]
+                    has_valid_data = bool(valid_data)
 
                     # Some Zigbee gateways advertise a second, non-functional
                     # endpoint for each physical cover.  A successful endpoint
@@ -1338,8 +1812,10 @@ class MessageHandler:
                     if (
                         not has_error
                         and not has_data
+                        and type_of_id != "conso"
                         and not device_metadata.get(unique_id)
                         and not endpoint.get("link")
+                        and _unconfigured_x3d_product(endpoint, device_id) is None
                     ):
                         LOGGER.debug(
                             "Ignoring empty endpoint placeholder "
@@ -1351,20 +1827,37 @@ class MessageHandler:
                         continue
 
                     if has_error:
-                        LOGGER.warning(
-                            "Endpoint avec erreur (création quand même) : "
-                            "device_id=%s, endpoint_id=%s, error=%s",
+                        self._record_endpoint_issue(
                             device_id,
                             endpoint_id,
+                            "reported an error",
                             endpoint.get("error"),
+                            name_of_id,
                         )
-
-                    if not has_data:
-                        LOGGER.warning(
-                            "Endpoint sans données valides (création avec état par défaut) : "
-                            "device_id=%s, endpoint_id=%s, name=%s",
+                    elif not has_data and type_of_id != "conso":
+                        self._record_endpoint_issue(
                             device_id,
                             endpoint_id,
+                            "returned no regular data",
+                            None,
+                            name_of_id,
+                        )
+                    elif not has_data:
+                        # Calybox/Tywatt consumption endpoints expose their values
+                        # through /devices/cdata rather than /devices/data.
+                        LOGGER.debug(
+                            "Ignoring expected empty regular data for cdata endpoint "
+                            "(device_id=%s, endpoint_id=%s, name=%s)",
+                            device_id,
+                            endpoint_id,
+                            name_of_id,
+                        )
+                    elif not has_valid_data:
+                        self._record_endpoint_issue(
+                            device_id,
+                            endpoint_id,
+                            "returned no up-to-date data",
+                            None,
                             name_of_id,
                         )
 
@@ -1406,15 +1899,13 @@ class MessageHandler:
                                 reference_uid
                             ] = reference
 
-                        # Only process data if available and valid
-                        if has_data and not has_error:
-                            for elem in endpoint["data"]:
+                        # Endpoint-level errors can accompany usable values. Trust
+                        # each field's validity instead of discarding the full payload.
+                        if has_valid_data:
+                            for elem in valid_data:
                                 element_name = elem["name"]
                                 element_value = elem["value"]
-                                element_validity = elem["validity"]
-
-                                if element_validity == "upToDate":
-                                    data[element_name] = element_value
+                                data[element_name] = element_value
 
                         if (
                             area_id is not None
@@ -1439,7 +1930,7 @@ class MessageHandler:
                                 "device_id": device_id,
                                 "endpoint_id": endpoint_id,
                             }
-                            if has_data and not has_error:
+                            if has_valid_data:
                                 LOGGER.info(
                                     "Device update (id=%s, endpoint=%s, name=%s, type=%s)",
                                     device_id,
@@ -1448,8 +1939,9 @@ class MessageHandler:
                                     type_of_id,
                                 )
                             else:
-                                LOGGER.info(
-                                    "Device créé sans données (id=%s, endpoint=%s, name=%s, type=%s)",
+                                LOGGER.debug(
+                                    "Device created without fresh data "
+                                    "(id=%s, endpoint=%s, name=%s, type=%s)",
                                     device_id,
                                     endpoint_id,
                                     name_of_id,
@@ -1598,10 +2090,24 @@ class MessageHandler:
                         data = {}
 
                         for elem in endpoint["cdata"]:
-                            if type_of_id == "conso":
+                            if type_of_id == "alarm":
+                                self._resolve_alarm_command_waiter(
+                                    device_id, endpoint_id, elem
+                                )
+                                values = elem.get("values") or {}
+                                event = values.get("event")
+                                if elem.get("name") == "eventAlarm" and isinstance(
+                                    event, dict
+                                ):
+                                    data["eventAlarm"] = event
+
+                            if type_of_id in {"conso", "plug"}:
                                 data.update(_parse_energy_cdata_element(elem))
 
-                            elif type_of_id == "alarm" and transaction_id is not None:
+                            elif type_of_id == "alarm" and transaction_id not in (
+                                None,
+                                "0",
+                            ):
                                 reply = None
                                 for r in self._cdata_replies:
                                     if r["transaction_id"] == transaction_id:
@@ -1679,7 +2185,7 @@ class MessageHandler:
                                     type_of_id,
                                 )
 
-                        if type_of_id == "conso" and data:
+                        if type_of_id in {"alarm", "conso"} and data:
                             device = await MessageHandler.get_device(
                                 self.tydom_client,
                                 type_of_id,
@@ -1772,10 +2278,12 @@ class MessageHandler:
 
     async def parse_groups_file(self, parsed, transaction_id):
         """Parse groups file and create TydomGroup devices."""
+        global groups_file_data
         LOGGER.debug("parse_groups_file : %s", parsed)
         devices = []
         # Store groups data for resolving grpAct in scenarios
         if parsed and isinstance(parsed, dict):
+            groups_file_data = copy.deepcopy(parsed)
             groups = parsed.get("groups", [])
             if isinstance(groups, list):
                 for group in groups:

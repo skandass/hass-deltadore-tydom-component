@@ -69,12 +69,45 @@ MessageHandler = handler_module.MessageHandler
 TydomLight = devices_module.TydomLight
 TydomEnergy = devices_module.TydomEnergy
 TydomAlarm = devices_module.TydomAlarm
+TydomOpenIssuesNotReadyError = devices_module.TydomOpenIssuesNotReadyError
 
 for name, original in _original_modules.items():
     if original is _MISSING:
         sys.modules.pop(name, None)
     else:
         sys.modules[name] = original
+
+
+def _alarm_with_command(
+    command: str,
+    values: list[str],
+    *,
+    away_zones: str = "1,3",
+    legacy: bool = False,
+) -> tuple[object, MagicMock]:
+    """Return an alarm advertising one writable cdata command."""
+    client = MagicMock()
+    client._zone_away = away_zones
+    client._zone_home = "1"
+    client._zone_night = "2"
+    client.put_alarm_cdata = AsyncMock()
+    alarm = TydomAlarm(
+        client,
+        "10_20",
+        "20",
+        "Alarm",
+        "alarm",
+        "10",
+        {},
+        {"part1State": "OFF"} if legacy else {},
+        command_metadata={
+            command: {
+                "permission": "w",
+                "parameters": [{"name": "value", "enum_values": values}],
+            }
+        },
+    )
+    return alarm, client
 
 
 class ProtocolResponseTests(IsolatedAsyncioTestCase):
@@ -84,6 +117,246 @@ class ProtocolResponseTests(IsolatedAsyncioTestCase):
         """Reset protocol state shared between tests."""
         handler_module.device_name.clear()
         handler_module.device_type.clear()
+        handler_module.device_command_metadata.clear()
+
+    async def test_alarm_command_metadata_is_retained_by_endpoint(self) -> None:
+        """Command capabilities must remain available to alarm entities."""
+        handler = MessageHandler(MagicMock(), b"")
+
+        await handler.parse_cmeta_data(
+            [
+                {
+                    "id": 20,
+                    "endpoints": [
+                        {
+                            "id": 10,
+                            "error": 0,
+                            "cmetadata": [
+                                {
+                                    "name": "zoneCmd",
+                                    "permission": "w",
+                                    "parameters": [
+                                        {
+                                            "name": "value",
+                                            "type": "string",
+                                            "enum_values": ["ON", "OFF", "FORCED_ON"],
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            None,
+        )
+
+        self.assertIn(
+            "FORCED_ON",
+            handler_module.device_command_metadata["10_20"]["zoneCmd"]["parameters"][0][
+                "enum_values"
+            ],
+        )
+
+    async def test_transac_zero_alarm_result_resolves_command_waiter(self) -> None:
+        """TYDOM alarm broadcasts must complete the matching pending command."""
+        handler = MessageHandler(MagicMock(), b"")
+        handler_module.device_name["10_20"] = "Alarm"
+        handler_module.device_type["10_20"] = "alarm"
+        waiter = handler.create_alarm_command_waiter("20", "10", "zoneCmd")
+
+        await handler.parse_devices_cdata(
+            [
+                {
+                    "id": 20,
+                    "endpoints": [
+                        {
+                            "id": 10,
+                            "error": 0,
+                            "cdata": [
+                                {
+                                    "name": "zoneCmd",
+                                    "values": {
+                                        "result": "DENIED",
+                                        "authent": "USER",
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "0",
+        )
+
+        self.assertEqual((await waiter)["values"]["result"], "DENIED")
+
+    async def test_force_arm_uses_advertised_zone_command(self) -> None:
+        """Modern alarms may force only a command advertised by cmetadata."""
+        alarm, client = _alarm_with_command("zoneCmd", ["ON", "OFF", "FORCED_ON"])
+
+        await alarm.force_arm("away", "123456")
+
+        client.put_alarm_cdata.assert_awaited_once_with(
+            "20", "10", "123456", "FORCED_ON", "1,3", False
+        )
+
+    async def test_force_arm_rejects_unadvertised_command(self) -> None:
+        """Force arming must not guess support when FORCED_ON is absent."""
+        alarm, client = _alarm_with_command("zoneCmd", ["ON", "OFF"])
+
+        with self.assertRaisesRegex(ValueError, "does not advertise FORCED_ON"):
+            await alarm.force_arm("away", "123456")
+
+        client.put_alarm_cdata.assert_not_awaited()
+
+    async def test_force_arm_uses_advertised_global_command(self) -> None:
+        """An empty configured zone selection must use the global alarm command."""
+        alarm, client = _alarm_with_command(
+            "alarmCmd", ["ON", "OFF", "FORCED_ON"], away_zones=""
+        )
+
+        await alarm.force_arm("away", "123456")
+
+        client.put_alarm_cdata.assert_awaited_once_with(
+            "20", "10", "123456", "FORCED_ON", "", False
+        )
+
+    async def test_force_arm_uses_advertised_legacy_part_command(self) -> None:
+        """Legacy alarms must retain their per-part command path."""
+        alarm, client = _alarm_with_command(
+            "partCmd", ["OFF", "ON", "FORCED_ON"], legacy=True
+        )
+
+        await alarm.force_arm("away", "123456")
+
+        client.put_alarm_cdata.assert_awaited_once_with(
+            "20", "10", "123456", "FORCED_ON", "1,3", True
+        )
+
+    async def test_spontaneous_alarm_event_is_forwarded_as_device_update(self) -> None:
+        """A pushed eventAlarm must reach the stored alarm device."""
+        handler = MessageHandler(MagicMock(), b"")
+        handler_module.device_name["10_20"] = "Alarm"
+        handler_module.device_type["10_20"] = "alarm"
+
+        devices = await handler.parse_devices_cdata(
+            [
+                {
+                    "id": 20,
+                    "endpoints": [
+                        {
+                            "id": 10,
+                            "error": 0,
+                            "cdata": [
+                                {
+                                    "name": "eventAlarm",
+                                    "parameters": {},
+                                    "values": {
+                                        "event": {
+                                            "name": "marcheTotale",
+                                            "product": {
+                                                "nameCustom": "TL 2000 Sandra",
+                                                "typeLong": "TL 2000",
+                                            },
+                                        }
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "0",
+        )
+
+        self.assertEqual(len(devices), 1)
+        self.assertEqual(devices[0].eventAlarm["name"], "marcheTotale")
+
+    async def test_alarm_actor_prefers_named_access_code(self) -> None:
+        """A spontaneous named user code must take precedence over product data."""
+        client = MagicMock()
+        stored = TydomAlarm(client, "10_20", "20", "Alarm", "alarm", "10", {}, {})
+        incoming = TydomAlarm(
+            client,
+            "10_20",
+            "20",
+            "Alarm",
+            "alarm",
+            "10",
+            {},
+            {
+                "eventAlarm": {
+                    "name": "arret",
+                    "accessCode": {"nameCustom": "Sandra"},
+                    "product": {"nameCustom": "TYDOM application"},
+                }
+            },
+        )
+
+        await stored.update_device(incoming)
+
+        self.assertEqual(stored.latest_alarm_actor, "Sandra")
+        self.assertEqual(stored.latest_alarm_actor_type, "access_code")
+        self.assertEqual(stored.latest_alarm_event_target, "disarmed")
+        self.assertEqual(stored.alarm_event_sequence, 1)
+
+    async def test_alarm_actor_uses_named_remote(self) -> None:
+        """A spontaneous named physical remote must populate the alarm actor."""
+        client = MagicMock()
+        stored = TydomAlarm(client, "10_20", "20", "Alarm", "alarm", "10", {}, {})
+        incoming = TydomAlarm(
+            client,
+            "10_20",
+            "20",
+            "Alarm",
+            "alarm",
+            "10",
+            {},
+            {
+                "eventAlarm": {
+                    "name": "marcheTotale",
+                    "product": {
+                        "nameCustom": "TL 2000 Sandra",
+                        "typeLong": "TL 2000",
+                    },
+                }
+            },
+        )
+
+        await stored.update_device(incoming)
+
+        self.assertEqual(stored.latest_alarm_actor, "TL 2000 Sandra")
+        self.assertEqual(stored.latest_alarm_actor_type, "product")
+        self.assertEqual(stored.latest_alarm_event_target, "armed")
+        self.assertEqual(stored.alarm_event_sequence, 1)
+
+    async def test_non_state_alarm_event_does_not_replace_actor(self) -> None:
+        """Intrusion and diagnostic events must not become changed_by actors."""
+        client = MagicMock()
+        stored = TydomAlarm(client, "10_20", "20", "Alarm", "alarm", "10", {}, {})
+        incoming = TydomAlarm(
+            client,
+            "10_20",
+            "20",
+            "Alarm",
+            "alarm",
+            "10",
+            {},
+            {
+                "eventAlarm": {
+                    "name": "intrusion",
+                    "product": {"nameCustom": "Living room detector"},
+                }
+            },
+        )
+
+        await stored.update_device(incoming)
+
+        self.assertIsNone(stored.latest_alarm_actor)
+        self.assertIsNone(stored.latest_alarm_actor_type)
+        self.assertIsNone(stored.latest_alarm_event_target)
+        self.assertEqual(stored.alarm_event_sequence, 0)
 
     def test_light_brightness_requires_intermediate_levels(self) -> None:
         """Binary level metadata must not advertise variable brightness."""
@@ -111,6 +384,200 @@ class ProtocolResponseTests(IsolatedAsyncioTestCase):
 
         self.assertFalse(binary_light.supports_brightness)
         self.assertTrue(dimmable_light.supports_brightness)
+
+    @staticmethod
+    def _profile_alarm(data: dict[str, str]) -> tuple[object, MagicMock]:
+        """Return an alarm with configurable profiles and live zone states."""
+        client = MagicMock()
+        client._zone_home = "3"
+        client._zone_night = "1,3"
+        client._zone_away = "1,2,3"
+        client.put_alarm_cdata = AsyncMock()
+        alarm = TydomAlarm(
+            client, "10_20", "20", "Alarm", "alarm", "10", {}, data
+        )
+        return alarm, client
+
+    async def test_alarm_profile_reduction_disables_only_surplus_zones(self) -> None:
+        """Away to Night must remove zone 2 without a global disarm."""
+        alarm, client = self._profile_alarm(
+            {"zone1State": "ON", "zone2State": "ON", "zone3State": "ON"}
+        )
+
+        await alarm.alarm_arm_night("123456")
+
+        client.put_alarm_cdata.assert_awaited_once_with(
+            "20", "10", "123456", "OFF", "2", False
+        )
+
+    async def test_alarm_profile_additions_precede_removals(self) -> None:
+        """A profile replacement must extend protection before reducing it."""
+        alarm, client = self._profile_alarm(
+            {"zone1State": "ON", "zone2State": "ON", "zone3State": "OFF"}
+        )
+        client._zone_home = "2,3"
+
+        await alarm.alarm_arm_home("123456")
+
+        self.assertEqual(
+            client.put_alarm_cdata.await_args_list,
+            [
+                call("20", "10", "123456", "ON", "3", False),
+                call("20", "10", "123456", "OFF", "1", False),
+            ],
+        )
+
+    async def test_alarm_profile_from_disarmed_enables_target_zones(self) -> None:
+        """Arming from OFF must enable the complete configured profile."""
+        alarm, client = self._profile_alarm(
+            {"zone1State": "OFF", "zone2State": "OFF", "zone3State": "OFF"}
+        )
+
+        await alarm.alarm_arm_home("123456")
+
+        client.put_alarm_cdata.assert_awaited_once_with(
+            "20", "10", "123456", "ON", "3", False
+        )
+
+    async def test_disarmed_mode_ignores_stale_zone_states(self) -> None:
+        """Explicit OFF mode must override zone values left over from arming."""
+        alarm, client = self._profile_alarm(
+            {"alarmMode": "OFF", "zone1State": "ON", "zone3State": "ON"}
+        )
+
+        await alarm.alarm_arm_home("123456")
+
+        client.put_alarm_cdata.assert_awaited_once_with(
+            "20", "10", "123456", "ON", "3", False
+        )
+
+    async def test_empty_alarm_profile_retains_global_arm_command(self) -> None:
+        """An unconfigured zone list must keep the established global command."""
+        alarm, client = self._profile_alarm({"zone1State": "OFF"})
+        client._zone_away = ""
+
+        await alarm.alarm_arm_away("123456")
+
+        client.put_alarm_cdata.assert_awaited_once_with(
+            "20", "10", "123456", "ON", "", False
+        )
+
+    async def test_alarm_profile_uses_updated_integration_configuration(self) -> None:
+        """Profile calculations must use current integration option values."""
+        alarm, client = self._profile_alarm(
+            {"zone1State": "ON", "zone2State": "OFF"}
+        )
+        client._zone_home = "2"
+
+        await alarm.alarm_arm_home("123456")
+
+        self.assertEqual(
+            client.put_alarm_cdata.await_args_list,
+            [
+                call("20", "10", "123456", "ON", "2", False),
+                call("20", "10", "123456", "OFF", "1", False),
+            ],
+        )
+
+    async def test_legacy_alarm_profiles_use_part_commands(self) -> None:
+        """Legacy alarm transitions must retain the part-command dispatcher."""
+        alarm, client = self._profile_alarm(
+            {"part1State": "ON", "part2State": "ON", "part3State": "OFF"}
+        )
+        client._zone_night = "2,3"
+
+        await alarm.alarm_arm_night("123456")
+
+        self.assertEqual(
+            client.put_alarm_cdata.await_args_list,
+            [
+                call("20", "10", "123456", "ON", "3", True),
+                call("20", "10", "123456", "OFF", "1", True),
+            ],
+        )
+
+    @staticmethod
+    def _legacy_alarm() -> tuple[TydomAlarm, MagicMock]:
+        """Return a CSX-style alarm advertising regular global commands."""
+        client = MagicMock()
+        client.put_devices_data = AsyncMock()
+        client.put_alarm_cdata = AsyncMock()
+        client._zone_away = ""
+        client._zone_home = "2"
+        client._zone_night = "1"
+        alarm = TydomAlarm(
+            client,
+            "10_20",
+            "20",
+            "Legacy alarm",
+            "alarm",
+            "10",
+            {
+                "alarmCmd": {
+                    "permission": "w",
+                    "enum_values": ["OFF", "ON", "FORCED_ON"],
+                },
+                "part1State": {"permission": "r"},
+            },
+            {"alarmMode": "OFF", "part1State": "OFF"},
+        )
+        return alarm, client
+
+    async def test_legacy_global_disarm_uses_regular_data(self) -> None:
+        """CSX-style alarmCmd must use its advertised regular data endpoint."""
+        alarm, client = self._legacy_alarm()
+
+        await alarm.alarm_disarm("unused-code")
+
+        client.put_devices_data.assert_awaited_once_with(
+            "20", "10", "alarmCmd", "OFF"
+        )
+        client.put_alarm_cdata.assert_not_awaited()
+
+    async def test_legacy_global_arm_uses_regular_data(self) -> None:
+        """A global legacy arm must not be sent to unsupported cdata."""
+        alarm, client = self._legacy_alarm()
+
+        await alarm.alarm_arm_away("unused-code")
+
+        client.put_devices_data.assert_awaited_once_with(
+            "20", "10", "alarmCmd", "ON"
+        )
+        client.put_alarm_cdata.assert_not_awaited()
+
+    async def test_legacy_partial_arm_retains_cdata_part_command(self) -> None:
+        """Configured CSX parts must retain the existing cdata dispatcher."""
+        alarm, client = self._legacy_alarm()
+
+        await alarm.alarm_arm_home("unused-code")
+
+        client.put_alarm_cdata.assert_awaited_once_with(
+            "20", "10", "unused-code", "ON", "2", True
+        )
+        client.put_devices_data.assert_not_awaited()
+
+    async def test_modern_alarm_retains_cdata_global_command(self) -> None:
+        """Modern zone-based alarms must retain authenticated cdata writes."""
+        client = MagicMock()
+        client.put_devices_data = AsyncMock()
+        client.put_alarm_cdata = AsyncMock()
+        alarm = TydomAlarm(
+            client,
+            "10_20",
+            "20",
+            "Modern alarm",
+            "alarm",
+            "10",
+            {"alarmCmd": {"permission": "w", "enum_values": ["OFF", "ON"]}},
+            {"alarmMode": "ON", "zone1State": "ON"},
+        )
+
+        await alarm.alarm_disarm("123456")
+
+        client.put_alarm_cdata.assert_awaited_once_with(
+            "20", "10", "123456", "OFF", None, False
+        )
+        client.put_devices_data.assert_not_awaited()
 
     async def test_alarm_inventory_merges_labels_and_technical_data(self) -> None:
         """Inventory responses should be useful without exposing other labels."""
@@ -215,7 +682,9 @@ class ProtocolResponseTests(IsolatedAsyncioTestCase):
         callback = MagicMock()
         alarm.register_callback(callback)
 
-        result = await alarm.get_events("UNACKED_EVENTS")
+        result = await alarm.get_events(
+            "UNACKED_EVENTS", timeout=10.0, log_timeout=False
+        )
 
         self.assertEqual(
             result,
@@ -233,13 +702,113 @@ class ProtocolResponseTests(IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(alarm.pending_events, result)
+        client.get_historic_cdata.assert_awaited_once_with(
+            "20",
+            "10",
+            "UNACKED_EVENTS",
+            log_timeout=False,
+            timeout=10.0,
+        )
         callback.assert_called_once_with()
 
-    async def test_acknowledgement_refreshes_cached_alarm_events(self) -> None:
-        """Acknowledgement must replace optimistic state with gateway history."""
+    async def test_open_issues_return_the_products_reported_by_the_central(self) -> None:
+        """OPEN_ISSUES must retain only dashboard-safe product metadata."""
+        client = MagicMock()
+        client.get_historic_cdata = AsyncMock(
+            return_value=[
+                {
+                    "values": {
+                        "product": {
+                            "id": 42,
+                            "nameCustom": "Office window",
+                            "nameStd": "MDO",
+                            "number": 3,
+                            "typeShort": "MDO",
+                            "typeLong": "Opening detector",
+                            "zone": 1,
+                            "privateRadioIdentifier": "hidden",
+                        },
+                        "defects": ["OPEN"],
+                    }
+                },
+                {
+                    "values": {
+                        "product": {
+                            "id": 43,
+                            "nameCustom": "Front door",
+                            "typeShort": "MO",
+                            "typeLong": "Door opening contact",
+                        },
+                        "defects": ["OPEN"],
+                    }
+                },
+                {"EOR": True},
+            ]
+        )
+        alarm = TydomAlarm(client, "10_20", "20", "Alarm", "alarm", "10", {}, {})
+        callback = MagicMock()
+        alarm.register_callback(callback)
+
+        result = await alarm.get_open_issues(timeout=10.0, log_timeout=False)
+
+        self.assertEqual(
+            result,
+            [
+                {
+                    "id": 42,
+                    "name": "Office window",
+                    "name_custom": "Office window",
+                    "name_standard": "MDO",
+                    "number": 3,
+                    "type_short": "MDO",
+                    "type_long": "Opening detector",
+                    "zone": 1,
+                    "defects": ["OPEN"],
+                },
+                {
+                    "id": 43,
+                    "name": "Front door",
+                    "name_custom": "Front door",
+                    "type_short": "MO",
+                    "type_long": "Door opening contact",
+                    "defects": ["OPEN"],
+                },
+            ],
+        )
+        self.assertEqual(alarm.open_issues, result)
+        client.get_historic_cdata.assert_awaited_once_with(
+            "20", "10", "OPEN_ISSUES", nbElement=50, log_timeout=False, timeout=10.0
+        )
+        callback.assert_called_once_with()
+
+    async def test_open_issues_does_not_replace_cache_with_central_error(self) -> None:
+        """A temporary OPEN_ISSUES error must be retried by the alarm entity."""
+        client = MagicMock()
+        client.get_historic_cdata = AsyncMock(
+            return_value=[
+                {
+                    "values": {
+                        "error": "error detected",
+                    }
+                },
+                {"EOR": True},
+            ]
+        )
+        alarm = TydomAlarm(client, "10_20", "20", "Alarm", "alarm", "10", {}, {})
+        alarm._open_issues = [{"id": 42, "name": "Previous issue"}]
+        callback = MagicMock()
+        alarm.register_callback(callback)
+
+        with self.assertRaises(TydomOpenIssuesNotReadyError):
+            await alarm.get_open_issues()
+
+        self.assertEqual(alarm.open_issues, [{"id": 42, "name": "Previous issue"}])
+        callback.assert_not_called()
+
+    async def test_acknowledgement_does_not_block_on_gateway_history(self) -> None:
+        """Acknowledgement must not issue an unsupported 60-second history read."""
         client = MagicMock()
         client.put_ackevents_cdata = AsyncMock()
-        client.get_historic_cdata = AsyncMock(return_value=[])
         alarm = TydomAlarm(client, "10_20", "20", "Alarm", "alarm", "10", {}, {})
         alarm._pending_events = [{"name": "INTRUSION"}]
         callback = MagicMock()
@@ -248,11 +817,9 @@ class ProtocolResponseTests(IsolatedAsyncioTestCase):
         await alarm.acknowledge_events()
 
         client.put_ackevents_cdata.assert_awaited_once_with("20", "10", None)
-        client.get_historic_cdata.assert_awaited_once_with(
-            "20", "10", "UNACKED_EVENTS"
-        )
-        self.assertEqual(alarm.pending_events, [])
-        callback.assert_called_once_with()
+        client.get_historic_cdata.assert_not_called()
+        self.assertEqual(alarm.pending_events, [{"name": "INTRUSION"}])
+        callback.assert_not_called()
 
     async def test_ignored_acknowledgement_keeps_pending_alarm_events(self) -> None:
         """A transport acknowledgement must not hide an uncleared gateway event."""
@@ -275,25 +842,58 @@ class ProtocolResponseTests(IsolatedAsyncioTestCase):
 
         await alarm.acknowledge_events()
 
-        self.assertEqual(
-            alarm.pending_events,
-            [{"name": "alarmIntrusion", "date": "2026-08-05T09:59:00"}],
-        )
+        self.assertEqual(alarm.pending_events, [{"name": "alarmIntrusion"}])
+        client.get_historic_cdata.assert_not_called()
 
     async def test_empty_success_response_is_treated_as_acknowledgement(self) -> None:
-        """An empty successful response must not be reported as an unknown message."""
+        """A bodyless tracked success response must complete its request."""
         logger.reset_mock()
         handler = MessageHandler(MagicMock(), b"")
+        reply_event = asyncio.Event()
+        handler._end_reply_events["request-1"] = reply_event
 
         devices = await handler.route_response(
             b"HTTP/1.1 200 OK\r\n"
             b"Uri-Origin: /devices/20/endpoints/10/data\r\n"
             b"Content-Type: application/json\r\n"
             b"Content-Length: 0\r\n"
-            b"Transac-Id: 0\r\n\r\n"
+            b"Transac-Id: request-1\r\n\r\n"
         )
 
         self.assertIsNone(devices)
+        self.assertTrue(reply_event.is_set())
+        self.assertEqual(handler.get_reply("request-1")["events"], [])
+        logger.warning.assert_not_called()
+
+    async def test_empty_devices_response_is_a_valid_inventory(self) -> None:
+        """An empty TYDOM inventory must not be reported as an unknown message."""
+        logger.reset_mock()
+        handler = MessageHandler(MagicMock(), b"")
+        handler.parse_devices_data = AsyncMock(return_value=[])
+
+        devices = await handler.route_response(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Uri-Origin: /devices/data\r\n"
+            b"Content-Type: application/json\r\n\r\n[]"
+        )
+
+        self.assertEqual(devices, [])
+        handler.parse_devices_data.assert_awaited_once_with([], None)
+        logger.warning.assert_not_called()
+
+    async def test_unsupported_optional_endpoint_is_remembered(self) -> None:
+        """A legacy gateway's missing scenarios endpoint is not a warning."""
+        logger.reset_mock()
+        client = MagicMock()
+        handler = MessageHandler(client, b"")
+
+        await handler.route_response(
+            b"HTTP/1.1 404 Not Found\r\n"
+            b"Uri-Origin: /scenarios/file\r\n"
+            b"Content-Type: text/html\r\n\r\nnot found"
+        )
+
+        client.mark_optional_path_unsupported.assert_called_once_with("/scenarios/file")
         logger.warning.assert_not_called()
 
     async def test_single_alarm_configuration_cdata_completes_reply(self) -> None:
