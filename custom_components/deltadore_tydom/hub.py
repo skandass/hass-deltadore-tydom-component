@@ -7,6 +7,7 @@ import copy
 import secrets
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 
 from aiohttp import ClientWebSocketResponse, ClientSession
@@ -67,10 +68,12 @@ from .ha_entities import (
     HATwcShutterCover,
     HASwitch,
     HAButton,
+    HACoverFavouriteButton,
     HADeviceAssociationButton,
     HADeviceRemovalButton,
     HAGroupableProductFinalizeAssociationButton,
     HAGatewayAssociationCategorySelect,
+    HAGatewayGeneralClimateSelect,
     HAGatewayAssociationChannelSelect,
     HAGatewayAssociationGuideButton,
     HAGatewayAssociationNameText,
@@ -164,6 +167,7 @@ class StandaloneAssociationRecipe:
     picto: str
     name_prefix: str
     first_usage: str | None = None
+    widget_action: str | None = None
 
 
 # These profiles are the request values used by the official TYDOM app. The
@@ -790,6 +794,11 @@ OFFICIAL_ASSOCIATION_CATALOG: dict[str, tuple[AssociationChoice, ...]] = {
         AssociationChoice("TYPASS ATL", "official:thermic_X3D_x3d_rm"),
         AssociationChoice("TYPASS CHX", "official:thermic_X3D_x3d_rm"),
         AssociationChoice("TYPASS SD", "official:thermic_X3D_x3d_rm"),
+        AssociationChoice(
+            "Tywell Control",
+            "official:thermic_X3D_x3d_pps",
+            required_gateway_names=frozenset({"tywell pro", "tywell home"}),
+        ),
         AssociationChoice("Tywell 2050 (RF 6050+)", "official:thermic_X3D_x3d_rm_es"),
         AssociationChoice("Tywell 2050 L (RF 6050+)", "official:thermic_X3D_x3d_rm_es"),
     ),
@@ -1040,6 +1049,15 @@ _OFFICIAL_THERMIC_BOILER_PRODUCTS = frozenset(
 _OFFICIAL_MODEL_ASSOCIATION_RECIPES: dict[
     tuple[str, str], StandaloneAssociationRecipe
 ] = {
+    # Tywell Control is a RE2020 wall controller, distinct from the Tywell
+    # 2050 thermostat kits. The values mirror its Tywell Pro/Home recipe.
+    ("Thermique", "Tywell Control"): StandaloneAssociationRecipe(
+        "re2020ControlBoiler",
+        "",
+        "Tywell Control",
+        "hvac",
+        "shutterCmd",
+    ),
     ("Fenêtres", "DETECTEUR VERROUILLAGE DVI SLIDING"): StandaloneAssociationRecipe(
         "windowSliding", "picto_window", "Fenêtre", "window"
     ),
@@ -1868,6 +1886,8 @@ async def configure_standalone_product(
     }
     if tutorial_id:
         configured_endpoint["widget_behavior"] = {"tutorial_id": tutorial_id}
+        if recipe.widget_action:
+            configured_endpoint["widget_behavior"]["action"] = recipe.widget_action
 
     updated_config = copy.deepcopy(config)
     if endpoint is None:
@@ -1959,6 +1979,8 @@ class Hub:
 
         self.online = True
         self._reload_button_created = False
+        self._general_climate_created = False
+        self._tydom_client.general_climate.add_listener(self._general_climate_updated)
         self._inventory_syncing = False
         self._inventory_sync_error: str | None = None
         self._association_controls_created = False
@@ -1988,6 +2010,7 @@ class Hub:
         self._pending_standalone_auto_finalize_failed = False
         self._refresh_energy_buttons_created: set[str] = set()
         self._device_association_buttons_created: set[tuple[str, str]] = set()
+        self._cover_favourite_buttons_created: set[tuple[str, str]] = set()
         self._remote_battery_entities: dict[str, HARemoteBattery] = {}
         self._interrupter_battery_entities: dict[str, HAInterrupterBattery] = {}
         self._twc_scene_sets: dict[str, dict[str, HAScene]] = {}
@@ -2086,6 +2109,10 @@ class Hub:
                     "Timed out closing Tydom websocket after credential test"
                 )
 
+    def _general_climate_updated(self) -> None:
+        """Create the gateway control when the optional feature is advertised."""
+        self.ready()
+
     def ready(self) -> bool:
         """Check if we're ready to work."""
         # and self.add_alarm_callback is not None
@@ -2141,7 +2168,19 @@ class Hub:
             self.add_text_callback([HAGatewayAssociationNameText(self)])
             self._association_controls_created = True
             LOGGER.debug("Gateway product-association controls created")
+        if is_ready:
+            self._ensure_general_climate_control()
         return is_ready
+
+    def _ensure_general_climate_control(self) -> None:
+        """Create the general control once per inventory lifecycle."""
+        if (
+            self.add_select_callback is not None
+            and not self._general_climate_created
+            and self._tydom_client.general_climate.support
+        ):
+            self.add_select_callback([HAGatewayGeneralClimateSelect(self)])
+            self._general_climate_created = True
 
     @property
     def association_categories(self) -> tuple[str, ...]:
@@ -2278,8 +2317,39 @@ class Hub:
         product = self._selected_groupable_product()
         if product is not None:
             return product.illustration_step_indexes
+        if self._association_product == "Tywell Control":
+            # The Android tutorial has a device-side preparation followed by
+            # the gateway action. Its sole visual depicts that preparation.
+            return (0,)
         _, illustrations, _ = self.association_illustration_layout
         return tuple(range(len(illustrations)))
+
+    @property
+    def association_gateway_listening_step_indexes(self) -> tuple[int, ...]:
+        """Return the precise guide steps where gateway listening starts.
+
+        The frontend uses this structured information rather than infer an
+        action location from translated guide text. The official catalogue
+        exposes this marker for every standard product.
+        """
+        product = self._selected_groupable_product()
+        if product is not None:
+            return tuple(
+                index
+                for index, step in enumerate(product.guide)
+                if "Lancer l'écoute de la passerelle" in step
+            )
+        if self._association_product == "Tywell Control":
+            return (1,)
+        return tuple(
+            index
+            for index, step in enumerate(
+                get_official_association_tutorial(
+                    self._association_product, self._association_category
+                )
+            )
+            if step.starts_gateway_listening
+        )
 
     @property
     def association_instructions(self) -> tuple[str, ...]:
@@ -2295,6 +2365,17 @@ class Hub:
                     channel_lower=channel.lower(),
                 )
                 for step in product.guide
+            )
+
+        if self._association_product == "Tywell Control":
+            # The official sentence combines a control on the device with the
+            # TYDOM application's "Associer" button. Split it into the order
+            # required by Home Assistant, whose button opens the gateway's
+            # listening window instead.
+            return (
+                "1. Sur le Tywell Control, lancez « Association avec la box Tywell ».",
+                "2. Dans Home Assistant, cliquez sur « Lancer l'écoute de la passerelle » ci-dessous.",
+                "3. Attendez la découverte et l'ajout automatique du contrôleur.",
             )
 
         tutorial = get_official_association_tutorial(
@@ -3034,11 +3115,65 @@ class Hub:
     async def _create_weather_device(self, device: TydomWeather) -> None:
         """Create weather device."""
         LOGGER.debug("Create weather %s", device.device_id)
-        ha_device = HaWeather(device, self._hass)
-        self.ha_devices[device.device_id] = ha_device
+        registry_targets = device.registry_device_targets
+        weather_entities = []
+        sensor_registry_targets = []
+        if len(registry_targets) > 1:
+            # One TYDOM weather endpoint can be shared by multiple Tywell Controls.
+            # Home Assistant allows only one parent device, so represent the
+            # endpoint once under its gateway instead of duplicating it under
+            # each controller.
+            weather_device_id = device.device_id
+            weather_device_name = "Weather"
+            sensor_registry_targets.append(
+                (weather_device_id, weather_device_name, "", None)
+            )
+            weather_entities.append(
+                HaWeather(
+                    device,
+                    self._hass,
+                    registry_device_id=weather_device_id,
+                    registry_device_name=weather_device_name,
+                    registry_translation_key="tywell_weather",
+                )
+            )
+        else:
+            for index, (registry_device_id, registry_device_name) in enumerate(
+                registry_targets
+            ):
+                unique_id_suffix = f"_shared_{registry_device_id}" if index > 0 else ""
+                weather_device_id = f"{device.device_id}_weather_{registry_device_id}"
+                weather_device_name = f"{registry_device_name} - Weather"
+                sensor_registry_targets.append(
+                    (
+                        weather_device_id,
+                        weather_device_name,
+                        unique_id_suffix,
+                        registry_device_id,
+                    )
+                )
+                weather_entities.append(
+                    HaWeather(
+                        device,
+                        self._hass,
+                        registry_device_id=weather_device_id,
+                        registry_device_name=weather_device_name,
+                        registry_parent_device_id=registry_device_id,
+                        unique_id_suffix=unique_id_suffix,
+                    )
+                )
+
+        if not weather_entities:
+            weather_entities.append(HaWeather(device, self._hass))
+        elif sensor_registry_targets:
+            weather_entities[0]._sensor_registry_targets = tuple(
+                sensor_registry_targets
+            )
+
+        self.ha_devices[device.device_id] = weather_entities[0]
         if self.add_weather_callback is not None:
-            self.add_weather_callback([ha_device])
-        self._add_discovered_entities(ha_device.get_sensors())
+            self.add_weather_callback(weather_entities)
+        self._add_discovered_entities(weather_entities[0].get_sensors())
 
     async def _create_water_device(self, device: TydomWater) -> None:
         """Create water/moisture device."""
@@ -3075,7 +3210,13 @@ class Hub:
         zone_key = ha_device._get_zone_from_scene()
         controller_id = ha_device._find_tywell_device(zone_key)
         parent_key = controller_id or f"tywell_control_{zone_key or 'default'}"
-        grouping_key = f"{parent_key}:{zone_key or 'default'}"
+        # A Tywell Control can expose more than one UP/DOWN/STOP trio.  The
+        # scenario names only contain the action, so group by the exact target
+        # set as well as its parent.  Otherwise a second Tywell Control (or a
+        # second shutter zone) overwrites the first controller's actions.
+        target_ids = sorted(ha_device._get_affected_device_ids())
+        target_key = "-".join(target_ids) if target_ids else "unknown-targets"
+        grouping_key = f"{parent_key}:{zone_key or 'default'}:{target_key}"
         scenes = self._twc_scene_sets.setdefault(grouping_key, {})
         scenes[action] = ha_device
 
@@ -3212,12 +3353,12 @@ class Hub:
 
             new_sensors = ha_device.get_sensors()
             if new_sensors:
-                # add new sensors
+                # Native translations can leave _attr_name unset. Log stable IDs.
                 LOGGER.debug(
                     "Ajout de %d nouveau(x) capteur(s) pour le device %s: %s",
                     len(new_sensors),
                     device.device_id,
-                    [s._attr_name for s in new_sensors],
+                    [sensor.unique_id for sensor in new_sensors],
                 )
                 self._add_discovered_entities(new_sensors)
             if isinstance(ha_device, HAEnergy):
@@ -3240,6 +3381,8 @@ class Hub:
         """Expose product controls, including permanent removal for every product."""
         if self.add_button_callback is None:
             return
+
+        self._maybe_create_cover_favourite_buttons(device)
 
         # Scenarios, moments and groups are configuration objects, not radio
         # products. In particular, TWC_UP/DOWN/STOP are three scenarios that
@@ -3395,6 +3538,27 @@ class Hub:
 
         if buttons:
             self._enable_existing_removal_buttons(buttons)
+            self.add_button_callback(buttons)
+
+    def _maybe_create_cover_favourite_buttons(self, device: TydomDevice) -> None:
+        """Expose favourite recall buttons only when TYDOM advertises support."""
+        if not isinstance(device, TydomShutter) or self.add_button_callback is None:
+            return
+
+        created = getattr(self, "_cover_favourite_buttons_created", None)
+        if created is None:
+            created = set()
+            self._cover_favourite_buttons_created = created
+
+        buttons = []
+        for number, command in ((1, "FAVORIT1"), (2, "FAVORIT2")):
+            key = (device.device_id, command)
+            if command not in device.favourite_commands or key in created:
+                continue
+            buttons.append(HACoverFavouriteButton(device, self._hass, number))
+            created.add(key)
+
+        if buttons:
             self.add_button_callback(buttons)
 
     def _enable_existing_removal_buttons(self, buttons: list[object]) -> None:
@@ -3755,11 +3919,28 @@ class Hub:
         for an immediate reading between scheduled polls.
         """
         while not self._shutting_down:
+            poll_event = self._tydom_client._poll_device_urls_5m_event
+            if not self._tydom_client.poll_device_urls_5m:
+                await poll_event.wait()
+                if self._shutting_down:
+                    return
+
+            # Metadata discovery can register cdata URLs after this background
+            # task starts. Wake up immediately for that first registration,
+            # then use the configured interval for subsequent regular polls.
+            poll_event.clear()
+            LOGGER.debug(
+                "Polling %s registered cdata requests",
+                len(self._tydom_client.poll_device_urls_5m),
+            )
             try:
                 await self._tydom_client.poll_devices_data_5m()
             except Exception:
                 LOGGER.exception("Error polling registered cdata endpoints")
-            await self._interruptible_sleep(self._refresh_interval)
+
+            interval = self._refresh_interval if self._refresh_interval > 0 else 60
+            with suppress(TimeoutError):
+                await asyncio.wait_for(poll_event.wait(), timeout=interval)
 
     async def reload_devices(self) -> None:
         """Recharger tous les appareils et entités comme au démarrage initial.
@@ -3777,10 +3958,12 @@ class Hub:
         self._twc_cover_entities.clear()
         # Réinitialiser le flag pour recréer le bouton après le rechargement
         self._reload_button_created = False
+        self._general_climate_created = False
         self._association_controls_created = False
         self._association_controls.clear()
         self._refresh_energy_buttons_created.clear()
         self._device_association_buttons_created.clear()
+        self._cover_favourite_buttons_created.clear()
 
         # Supprimer toutes les entités existantes via l'Entity Registry
         from homeassistant.helpers import entity_registry as er
@@ -3842,6 +4025,10 @@ class Hub:
             )
             self.add_text_callback([HAGatewayAssociationNameText(self)])
             self._association_controls_created = True
+
+        # Registry removal above also removes gateway controls. General state
+        # may be unchanged, so no new feedback callback will recreate this one.
+        self._ensure_general_climate_control()
 
         LOGGER.info(
             "Rechargement terminé, les nouveaux appareils seront découverts automatiquement"

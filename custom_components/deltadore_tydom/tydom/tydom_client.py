@@ -38,6 +38,7 @@ from .const import (
     DELTADORE_AUTH_URL,
     MEDIATION_URL,
 )
+from ..home_climate import HomeClimateState, HVAC_OPTIONS
 from .MessageHandler import MessageHandler
 from .tydom_devices import TydomAlarmCommandError
 
@@ -109,6 +110,8 @@ proxy = None
 _LOCAL_PASSWORD_URI = "/configs/gateway/password"
 _LOCAL_PASSWORD_MAX_MESSAGES = 5
 _LOCAL_PASSWORD_MAX_RESPONSE_BYTES = 64 * 1024
+# Live gateways can take about 45 seconds to start a cdata response.
+_CDATA_POLL_RESPONSE_TIMEOUT = 90.0
 
 # DEBUG ONLY — replaces websocket with a local trace file
 file_mode = False
@@ -149,12 +152,15 @@ class TydomClient:
         self._connection: ClientWebSocketResponse | None = None
         self._connection_ready = False
         self._connection_lock = asyncio.Lock()
+        self._cdata_poll_lock = asyncio.Lock()
         self._initialising_task: asyncio.Task | None = None
         self._shutdown_event = asyncio.Event()
         self.event_callback = event_callback
+        self.general_climate = HomeClimateState()
         # Some devices (like Tywatt) need polling
         self.poll_device_urls_1s = []
         self.poll_device_urls_5m = []
+        self._poll_device_urls_5m_event = asyncio.Event()
         self.current_poll_index = 0
         self.pending_pings = 0
 
@@ -529,12 +535,19 @@ class TydomClient:
                     )
                 }
 
+            # The local gateway is already monitored by the application-level
+            # /ping exchange. Its WebSocket control-PONG response can be
+            # delayed or missed even while that exchange remains healthy, so
+            # do not let aiohttp's one-second heartbeat deadline close the
+            # persistent local connection. autoping still replies to PINGs
+            # sent by the gateway.
+            heartbeat = 2.0 if self._host == MEDIATION_URL else None
             connection = await session.ws_connect(
                 method="GET",
                 url=f"wss://{self._host}:443/mediation/client?mac={self._mac}&appli=1",
                 headers=ws_headers,
                 autoping=True,
-                heartbeat=2.0,
+                heartbeat=heartbeat,
                 timeout=TIMEOUT_WEBSOCKET_CONNECT,  # type: ignore[arg-type]
                 receive_timeout=TIMEOUT_WEBSOCKET_RECEIVE,
                 autoclose=True,
@@ -562,6 +575,7 @@ class TydomClient:
         """Signal that the client must stop reconnecting and using the socket."""
         self._shutting_down = True
         self._shutdown_event.set()
+        self._poll_device_urls_5m_event.set()
 
     async def _wait_or_shutdown(self, delay: float) -> bool:
         """Wait for a delay and return whether shutdown interrupted the wait."""
@@ -686,6 +700,7 @@ class TydomClient:
         await self.get_devices_cmeta()
         await self.get_devices_data()
         await self.get_areas_data()
+        await self.get_home_climate_data()
         if self._shutting_down:
             return
 
@@ -788,7 +803,7 @@ class TydomClient:
                 sanitized_msg = sanitize_log_message(
                     incoming_bytes_str.decode("utf-8", errors="replace"), self._password
                 )
-                LOGGER.info("Incomming message - message : %s", sanitized_msg)
+                LOGGER.debug("Incomming message - message : %s", sanitized_msg)
             else:
                 await asyncio.sleep(10)
                 return None
@@ -815,7 +830,14 @@ class TydomClient:
                 await self._reconnect_with_backoff()
                 return None
 
-            msg = await connection.receive()
+            try:
+                msg = await connection.receive()
+            except TimeoutError:
+                if not self._remote_mode:
+                    # The local socket can be idle between gateway events;
+                    # its connection health is monitored separately through /ping.
+                    return None
+                raise
             # Masquer les informations sensibles dans les messages entrants
             msg_data_str = (
                 msg.data.decode("utf-8", errors="replace")
@@ -823,7 +845,7 @@ class TydomClient:
                 else str(msg.data)
             )
             sanitized_msg = sanitize_log_message(msg_data_str, self._password)
-            LOGGER.info(
+            LOGGER.debug(
                 "Incoming message - type : %s - message : %s", msg.type, sanitized_msg
             )
 
@@ -1330,11 +1352,12 @@ class TydomClient:
             prefix = f"/devices/{device_id}/endpoints/{endpoint_id}/"
             urls = [url for url in urls if url.startswith(prefix)]
 
-        for url in urls:
-            try:
-                await self.get_poll_device_data(url)
-            except Exception:
-                LOGGER.exception("Error polling cdata endpoint %s", url)
+        async with self._cdata_poll_lock:
+            for url in urls:
+                try:
+                    await self.get_poll_device_data(url)
+                except Exception:
+                    LOGGER.exception("Error polling cdata endpoint %s", url)
 
     async def get_configs_file(self):
         """List the devices to get the endpoint id."""
@@ -1434,10 +1457,32 @@ class TydomClient:
             await self.send_bytes(a_bytes)
 
     async def get_poll_device_data(self, url):
-        """Poll a device."""
-        msg_type = url
-        req = "GET"
-        await self.send_message(method=req, msg=msg_type)
+        """Poll a device and wait for cdata streams to finish before continuing."""
+        if not url.split("?", 1)[0].endswith("/cdata"):
+            await self.send_message(method="GET", msg=url)
+            return
+
+        headers = {
+            "Content-Length": "0",
+            "Content-Type": "application/json; charset=UTF-8",
+        }
+        transaction_id, request = self._message_handler.prepare_request(
+            "GET", url, headers=headers
+        )
+        completion_event = self._message_handler.register_cdata_poll(transaction_id)
+        try:
+            await self.send_bytes(request)
+            try:
+                await asyncio.wait_for(
+                    completion_event.wait(), timeout=_CDATA_POLL_RESPONSE_TIMEOUT
+                )
+            except TimeoutError:
+                LOGGER.debug(
+                    "Timed out waiting for cdata response to %s",
+                    sanitize_log_message(url),
+                )
+        finally:
+            self._message_handler.remove_cdata_poll(transaction_id)
 
     async def poll_device_data(self, device_id, endpoint_id=None):
         """Poll data for a single device.
@@ -1468,6 +1513,7 @@ class TydomClient:
         """Add a device for polling."""
         if url not in self.poll_device_urls_5m:
             self.poll_device_urls_5m.append(url)
+            self._poll_device_urls_5m_event.set()
 
     async def get_moments(self):
         """Get the moments (programs)."""
@@ -1476,6 +1522,18 @@ class TydomClient:
             return
         req = "GET"
         await self.send_message(method=req, msg=msg_type)
+
+    async def get_moments_file_document(self) -> dict[str, object]:
+        """Read a fresh, complete gateway programme without changing it.
+
+        Unlike background polling, an explicit read retries a previously missing
+        optional endpoint. A missing file must not masquerade as an empty plan.
+        Preserve the original schema and shared routine references.
+        """
+        return self._file_reply_document(
+            await self.get_reply_to_request("GET", "/moments/file"),
+            "/moments/file",
+        )
 
     async def suspend_moment(self, moment_id: str | int, suspend_to: int = -1) -> None:
         """Suspend or resume a moment/program.
@@ -1650,8 +1708,42 @@ class TydomClient:
         LOGGER.debug("Sending message to tydom (%s)", "PUT device data")
         return 0
 
+    async def get_home_climate_data(self) -> None:
+        """Read general HVAC and absence; older gateways may omit these endpoints."""
+        for path in ("/home/hvac/data", "/home/absence"):
+            if path not in self._unsupported_optional_paths:
+                await self.send_message(method="GET", msg=path)
+
+    async def put_home_absence(self, until: int) -> None:
+        """Set general absence using the official app's -1/0 convention."""
+        body = json.dumps({"to": until})
+        request = (
+            "PUT /home/absence HTTP/1.1\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Content-Type: application/json; charset=UTF-8\r\n"
+            "Transac-Id: 0\r\n\r\n" + body + "\r\n\r\n"
+        )
+        if not file_mode:
+            await self.send_bytes(self._cmd_prefix + request.encode("ascii"))
+
+    async def set_general_climate_mode(self, option: str) -> None:
+        """Send an explicit installation-wide command, never a series of zone writes."""
+        state = self.general_climate
+        if option not in state.options:
+            raise ValueError("Unsupported general climate mode")
+        if option == "mixed":
+            return  # A reported state, not an instruction.
+        if option == "away":
+            await self.put_home_absence(-1)
+        else:
+            if state.absence_active:
+                await self.put_home_absence(0)
+            mode = next(mode for mode, value in HVAC_OPTIONS.items() if value == option)
+            await self.put_home_hvac_mode(mode)
+        await self.get_home_climate_data()
+
     async def put_home_hvac_mode(self, mode: str) -> int:
-        """Set the zone-level HVAC direction (STOP / HEATING / COOLING).
+        """Set the installation-wide HVAC direction (STOP / HEATING / COOLING).
 
         Tydom broadcasts the result to all thermostats via per-device
         authorization updates. Per-thermostat hvacMode writes are ignored.

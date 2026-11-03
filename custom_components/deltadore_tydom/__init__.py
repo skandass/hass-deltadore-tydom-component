@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from hashlib import sha256
 from pathlib import Path
 
 import homeassistant.helpers.config_validation as cv
@@ -22,14 +23,18 @@ from .const import (
     CONF_ZONES_AWAY,
     CONF_ZONES_NIGHT,
     CONF_REFRESH_INTERVAL,
+    CONF_ENTITY_MODE,
+    ENTITY_MODE_ALL,
     LOGGER,
 )
 from .device_removal import can_remove_device
+from .entity_profile import EntityProfile
 from .ha_entities import ASSOCIATION_COMMAND, IDENTIFY_COMMAND, start_command
 from .hub import (
     remove_product_association,
     start_product_association,
 )
+from .schedule import async_register_schedule_service
 
 # Config schema for hassfest validation
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -60,11 +65,21 @@ ASSOCIATION_GUIDE_FRONTEND_URL = f"/{DOMAIN}/frontend/association-guide.js"
 ASSOCIATION_GUIDE_FRONTEND_PATH = (
     Path(__file__).parent / "frontend" / "association-guide.js"
 )
+# The mobile companion app can keep an older frontend asset in its WebView
+# cache even after the custom integration has been updated.  Give each script
+# revision its own URL so a fresh frontend bootstrap cannot reuse that asset.
+ASSOCIATION_GUIDE_FRONTEND_VERSION = sha256(
+    ASSOCIATION_GUIDE_FRONTEND_PATH.read_bytes()
+).hexdigest()[:12]
+ASSOCIATION_GUIDE_FRONTEND_RESOURCE_URL = (
+    f"{ASSOCIATION_GUIDE_FRONTEND_URL}?v={ASSOCIATION_GUIDE_FRONTEND_VERSION}"
+)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up the Delta Dore Tydom integration."""
 
+    async_register_schedule_service(hass)
     await hass.http.async_register_static_paths(
         [
             StaticPathConfig(
@@ -74,7 +89,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             )
         ]
     )
-    add_extra_js_url(hass, ASSOCIATION_GUIDE_FRONTEND_URL)
+    add_extra_js_url(hass, ASSOCIATION_GUIDE_FRONTEND_RESOURCE_URL)
 
     def get_tydom_device(entity_id: str):
         """Return the TYDOM device represented by an integration entity."""
@@ -545,6 +560,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # This creates each HA object for each platform your device requires.
     # It's done by calling the `async_setup_entry` function in each platform module.
+    tydom_hub.entity_profile = EntityProfile(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
@@ -599,4 +615,7 @@ async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
         entry.data[CONF_ZONES_HOME],
         entry.data[CONF_ZONES_AWAY],
         entry.data[CONF_ZONES_NIGHT],
+    )
+    tydom_hub.entity_profile.async_set_mode(
+        entry.data.get(CONF_ENTITY_MODE, ENTITY_MODE_ALL)
     )

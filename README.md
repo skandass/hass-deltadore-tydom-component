@@ -24,10 +24,11 @@ The Delta Dore gateway can be detected using DHCP discovery.
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
-- [Gateway association, identification and radio removal — new, work in progress](#gateway-association-identification-and-radio-removal--new-work-in-progress)
+- [Gateway association, identification and radio removal](#gateway-association-identification-and-radio-removal)
 - [Illustrated association guides](#illustrated-association-guides)
 - [Capturing data for unsupported devices](#capturing-data-for-unsupported-devices)
 - [TYXAL+ remote management](#tyxal-remote-management)
+- [TYDOM programme snapshot — experimental, read-only](#tydom-programme-snapshot--experimental-read-only)
 - [Known limitations](#known-limitations)
 - [Security](#security)
 - [Contributing](#contributing)
@@ -37,7 +38,7 @@ The Delta Dore gateway can be detected using DHCP discovery.
 Platform | Description
 -- | --
 `alarm_control_panel` | Controls a TYXAL alarm.
-`binary_sensor` | Reports binary states and diagnostics.
+`binary_sensor` | Reports binary states, diagnostics and the gateway firmware update flag.
 `button` | Exposes stateless controls such as gate, garage door and alarm actions.
 `climate` | Controls heating, cooling and ventilation.
 `cover` | Controls shutters, blinds and awnings.
@@ -49,7 +50,7 @@ Platform | Description
 `select` | Controls writable enumerated settings exposed by a device.
 `sensor` | Reports measurements and device information.
 `switch` | Controls binary outputs, plugs and TYDOM moments.
-`update` | Installs supported TYDOM firmware updates.
+`update` | Exposes gateway firmware updates reported by TYDOM and starts installation; the target version is unavailable, so Home Assistant displays generic `latest`.
 `weather` | Reports weather information.
 
 ### Feature highlights
@@ -72,6 +73,30 @@ Platform | Description
 - Add, identify and safely remove compatible radio products directly from the
   gateway device page, with model-specific guidance and automatic inventory
   refresh after a successful operation.
+
+- Expose current humidity on climate entities when TYDOM advertises `hygroIn`,
+  and expose a native humidity sensor where that reading is supplied. Map the
+  TYDOM absence mode to Home Assistant's Away preset when advertised or
+  reported, allowing commands only when metadata marks it writable. Map
+  `ANTI_FROST` to Frost on reversible zone thermostats.
+- Recover writable setpoints for Tywell Control and Typass ATL climate entities
+  when live data arrives before optional metadata. Group each Tywell Control's
+  shutter scenarios by controller and exact shutter targets so multiple
+  controllers do not overwrite one another.
+- Share one weather device when multiple Tywell Controls reference the same
+  endpoint, keeping its weather entity and endpoint sensors together. Readings
+  include outdoor temperature, conditions, current and daily power, and daily
+  maximum outdoor temperature.
+- Expose a Home Assistant update entity when the gateway reports firmware
+  availability. Starting installation uses the TYDOM gateway update operation;
+  the target version is not provided, so Home Assistant displays generic
+  `latest`.
+- Download diagnostics for the integration and individual devices. They use
+  data already held by the integration, and Home Assistant redacts known
+  sensitive fields.
+- Use `deltadore_tydom.set_mode_using_stored_pin` in automations to arm or
+  disarm TYXAL+ with the PIN saved for that config entry. The manual alarm
+  panel continues to request the PIN.
 
 ### Tested hardware
 
@@ -164,9 +189,34 @@ TYDOM password | Manual mode | The gateway password, which is different from the
 Refresh interval | Yes | Periodic refresh interval from 1 to 1,440 minutes; the default is 30 minutes. Push events remain active between refreshes.
 Home, Away and Night zones | No | Comma-separated TYXAL zone IDs from 0 to 8, for example `1,2,4`. Each field defines the zones armed by that Home Assistant alarm mode.
 Alarm PIN | No | Required when using Home Assistant to change the alarm mode; not required for read-only alarm state.
+Entity mode | Yes | **Full (all entities)** by default, or **Simplified (essential entities)** to disable technical entities.
 
 After setup, open the integration's **Configure** menu to change the refresh
-interval, alarm zones or PIN.
+interval, alarm zones, PIN or entity mode.
+
+### Full or simplified entity mode
+
+Choose the mode during setup or later under **Configure → Configure**. The
+setting applies to all devices belonging to this integration entry.
+
+- **Full** keeps the usual entity defaults; upgrading does not change existing
+  installations.
+- **Simplified** keeps everyday controls and useful readings: lights, covers,
+  heating settings, remote-button events, opening, smoke and leak detection,
+  temperature and energy measurements. Alarm state, pending issues, battery
+  faults and transmission faults remain available, as do smoke-detector battery
+  warnings. Technical registers, firmware details and maintenance/configuration
+  controls are disabled.
+
+Disabled entities remain in Home Assistant's entity registry, with the same
+identifiers. Enable any you need individually in **Settings → Devices & services
+→ Entities**, using the filter for disabled entities. Individual changes are
+preserved when devices are reloaded or Home Assistant restarts.
+
+Changing an existing installation to Simplified also disables its technical
+entities: check any automations or dashboards that use them before switching.
+Returning to Full restores only entities disabled by this mode, not entities
+you disabled manually or controls disabled by default.
 
 ### Pair locally using the gateway button
 
@@ -187,6 +237,76 @@ This feature does not reset the gateway, change its password, remove products
 or alter associations. It does not use the Delta Dore cloud. A separate entry
 configured for cloud/mediation continues to use its own configured connection.
 
+### Entity names
+
+Measurements, settings, diagnostics and gateway controls use descriptive names
+across all supported device families. The full device-family catalogue is
+translated in British English, French, German, Spanish, Italian, Portuguese,
+Dutch and Polish, according to Home Assistant's language. Czech and Norwegian
+Bokmål resources also add the shared Tywell weather device and its readings,
+along with selected common sensor and diagnostic entity names. Coverage varies
+by entity across the ten locales; labels without a translation remain in
+English.
+
+The eight distribution and index sensors on TYWATT 1000 RT 2012 use
+Delta Dore terminology in English, French, German, Spanish, Italian and
+Portuguese; Dutch and Polish fall back to English. These labels do not change
+protocol attributes or entity identifiers.
+
+Device and scene names chosen in TYDOM, and entity names customised in Home
+Assistant, are preserved. Existing entity identifiers and automation references
+remain valid. Unknown attributes advertised by newer gateway firmware retain a
+readable technical name until a matching label is added.
+
+### Thermostat commands and temperature limits
+
+The climate entity uses the device's current heating or cooling setpoint limits, including installer limits reported by TYDOM. Out-of-range temperatures are rejected before sending a command.
+
+General Off takes priority over zone controls. Whilst it is active, Home Assistant disables zone mode, preset and target-temperature changes; a zone request never restarts heating for the whole installation. Reactivate the general mode in TYDOM first. For zones controlled through `localMode`, the zone's Off state follows `localMode: STOP` or `ANTI_FROST`. A separate `thermicLevel: ANTI_FROST` on an enabled (`localMode: NORMAL`) zone keeps its Heat mode with an Idle action. Frost feedback is not shown as a normal heating target, including the misleading 30 °C value returned by some areas.
+
+If an enabled zone remains in frost protection after general heating resumes, an explicit Heat request can reuse its last confirmed heating target. This never changes the general mode or sends a default temperature. If no valid target has been received since startup or an inventory rebuild, choose one explicitly with `climate.set_temperature`. Actual temperature feedback is required to confirm that setpoint request.
+
+The diagnostic **Command pending** binary sensor switches on when Home Assistant sends a mode, temperature or preset request. For every climate entity, including heating and air conditioning, a requested target temperature is displayed immediately while awaiting confirmation. The actual target remains available in the `reported_temperature` climate attribute; completing the network send does not confirm the physical change. The indicator switches off when a subsequent TYDOM update reports the requested value, or if sending fails. Multiple outstanding requests are confirmed separately.
+
+Mode and preset requests publish their pending status through this diagnostic sensor without republishing the climate's unchanged mode or preset. The climate is updated when TYDOM supplies feedback or its displayed target temperature changes. For immediate command-status tracking, use the diagnostic sensor and its attributes; the climate tracking attributes reflect its latest published state.
+
+If sending fails, the displayed target returns to the latest value reported by TYDOM. After two minutes without matching feedback, the status becomes `unconfirmed`, the indicator switches off and the displayed target returns to the reported value. This does not prove the command failed; a later update can still confirm it. There is no automatic resend. The requested values and `command_status` are also available as climate attributes. Pending requests are cleared when the integration is unloaded.
+
+### General heating and air conditioning mode
+
+On supported gateways, **General climate mode** appears in the gateway device's **Controls** section. It is separate from every Tybox, Tywell Control and other zone climate entity. Available choices come from the gateway's capability list: Off, Heating, and Cooling, Fan only or Dry where supported. Away uses the separate general absence command; selecting a normal mode ends general absence first. Existing timed absences are reported without changing their deadline.
+
+The control follows the gateway's reported state. Mixed is an aggregate display state, not a command and is never sent as a heating or cooling instruction. General requests use the gateway resources directly; they do not rewrite zone temperatures or send a batch of per-zone commands. Firmware without these optional resources does not gain a misleading general control.
+
+### Diagnostic entities
+
+Internal counters (`activationCpt`, `activationIndex`, `indexTimeOn`,
+`timeOnCpt`), device and area identifiers (`uid`, `area_id`), task registers
+(`jobs`, `jobsMP`, `jobsRM`), load shedding (`loadSheddingOn`) and maintenance
+status (`maintenanceNeeded`) appear in Home Assistant's **Diagnostic** section
+where supplied by the device. This applies to both sensors and binary sensors
+across device families.
+
+These entities keep their identifiers and values for existing automations.
+Categorisation does not disable them or change your enabled/disabled choices.
+Temperature, humidity, setpoints and operating settings stay in the main view.
+
+### Thermostat operating mode
+
+Where TYDOM reports `useMode`, the new **Thermostat operating mode** Enum sensor shows **Schedule**, **Override** or **Manual** in the main Sensors section. It follows the device's actual feedback, with labels in all ten supported languages. Its HA states are `sched`, `override` and `manual`, as lowercase keys are required for native state translations.
+
+The existing **Operating mode** sensor retains its identity and raw `SCHED`, `OVERRIDE` and `MANUAL` states for existing automations. Both sensors observe the same register without sending commands or changing schedules. A future firmware value remains visible in the new Enum sensor in lowercase; the original sensor retains the exact raw value.
+
+Gateway API, protocol, software-version and update-status readings are also
+diagnostic where available.
+
+### Download diagnostics
+
+Download diagnostics from the integration config-entry page or an individual
+device page. The file is assembled from data already held by the integration
+and does not make an additional gateway request. Home Assistant redacts known
+sensitive fields, but review the file before sharing it publicly.
+
 ## Troubleshooting
 
 ### Enable debug logging
@@ -204,6 +324,10 @@ logger:
   logs:
     custom_components.deltadore_tydom: debug
 ```
+
+Some optional TYDOM endpoints are not implemented by every gateway or product.
+Their absence is logged at DEBUG level; HTTP errors for requests that do run
+remain warnings.
 
 ### Authentication and communication errors
 
@@ -251,7 +375,7 @@ After a configuration change, an old registry entry may first appear as
 **Unavailable** or **No longer provided**. Verify that the replacement device
 is present and working before using **Remove device**.
 
-## Gateway association, identification and radio removal — new, work in progress
+## Gateway association, identification and radio removal
 
 The **Configuration** card on the TYDOM/Tywell gateway device provides the
 radio-management controls. These act on the physical gateway; they are not
@@ -301,11 +425,13 @@ existing automations.
 
 ## Illustrated association guides
 
-Guided association and dissociation will be included in the next release.
-This feature is still a work in progress: the guides below have been confirmed
-on the stated gateway type, while support for other compatible products is
-being added and needs real-world confirmation. Select the relevant product and
-channel in Home Assistant, then follow the illustrated steps in order.
+Guided association is available in Home Assistant. The model-specific guides
+below adapt the official device procedures to the Home Assistant workflow.
+Hardware confirmation applies only to the products and gateway types marked
+as confirmed; other compatible products may show an official guide but still
+need real-world validation. Select the product and channel in Home Assistant,
+then follow the steps in order. Press **Start gateway listening** only when
+the guide reaches that point.
 
 <details>
 <summary><strong>TYXIA 2600 wall switch — Button A or B — Confirmed gateway: Tywell Pro</strong></summary>
@@ -465,6 +591,29 @@ Use **Permanently dissociate device** to remove it from the gateway.
 
 </details>
 
+<details>
+<summary><strong>Tywell Control — Confirmed gateway: Tywell Pro</strong></summary>
+
+1. On the TYDOM/Tywell gateway device page in Home Assistant, select the
+   **Tywell Control** association recipe and open **Show association guide**.
+2. On the Tywell Control, put the Tywell gateway into association mode as
+   instructed. The official guide shows the control screen below.
+
+   <img src="docs/images/association/catalog_tywell_control_step1.svg" width="48%" alt="Tywell Control screen shown in the official association step">
+
+3. Once the Tywell gateway is in association mode, press **Start gateway
+   listening** in Home Assistant. Do not start listening before this point.
+4. A progress bar appears directly on the Tywell Control while pairing runs.
+   Wait for its successful-association message.
+
+   <img src="docs/images/association/catalog_tywell_control_step2.svg" width="48%" alt="Progress bar displayed on the Tywell Control during association">
+
+5. Home Assistant discovers the new controller and refreshes the gateway
+   inventory automatically. This workflow was validated for a second Tywell
+   Control on a Tywell Pro gateway.
+
+</details>
+
 ### Device association and identification
 
 Some devices expose association and physical-identification commands through
@@ -508,6 +657,9 @@ also accepts a `config_entry_id`, so it can target a newly configured gateway
 that has no entities yet. `deltadore_tydom.remove_product_association` removes
 the selected product from the physical gateway (not only from Home Assistant)
 and therefore requires `confirm: true`.
+
+
+
 
 ## Capturing data for unsupported devices
 
@@ -585,6 +737,41 @@ configuration are not exposed.
 only after checking the reported defects and deciding that forced arming is
 appropriate.
 
+### Automations using the stored alarm PIN
+
+The optional `deltadore_tydom.set_mode_using_stored_pin` action lets an
+automation arm or disarm using the **Alarm PIN** saved in the selected alarm's
+integration settings, without copying it into each automation. Choose `away`,
+`home`, `night` or `disarm`; arming uses the zones configured for that mode.
+If no PIN is saved, the action fails without sending an alarm command.
+
+```yaml
+action: deltadore_tydom.set_mode_using_stored_pin
+target:
+  entity_id: alarm_control_panel.tyxal_alarm
+data:
+  mode: night
+```
+
+Use `mode: disarm` to disarm with the same stored PIN. For multiple TYDOM
+integration entries, each targeted alarm uses its own entry's PIN.
+
+The alarm entity, entity ID and standard `alarm_control_panel` actions remain
+unchanged. The standard Home Assistant alarm panel still requests a code with
+its existing configuration. Existing automations supplying a code continue to
+work; switching to this new action is optional.
+
+**Security:** a caller authorised to run this action can arm or disarm without
+entering the PIN again. Restrict access to Home Assistant and review automation
+triggers accordingly. This is normal arming, not forced arming: reported
+defects and gateway refusals are still handled by the existing command flow.
+The action does not expose the stored PIN in its response or state attributes.
+
+This feature is for Home Assistant actions and automations. It does not add or
+configure HomeKit support, change the HomeKit bridge's calls, or guarantee
+operation through Apple Home. It does not establish complete support for a
+new alarm hub merely because one command succeeds.
+
 ### Alarm blockers and refused arming
 
 `deltadore_tydom.get_open_issues` asks the alarm central for the products which
@@ -629,6 +816,39 @@ When TYDOM reports the actor for an alarm transition, the alarm entity exposes
 either `access_code` or `product`. These attributes describe the latest
 reported arm or disarm transition.
 
+## TYDOM programme snapshot — experimental, read-only
+
+The `deltadore_tydom.get_schedule` action reads the complete programming
+document from the selected gateway's `/moments/file` endpoint. This is the
+read-only first stage of [#490](https://github.com/CyrilP/hass-deltadore-tydom-component/issues/490),
+pending validation against real TYDOM programmes. It does not change a
+programme, setpoint or operating mode. There is no `set_schedule` action yet.
+
+In **Developer tools > Actions**, select **Get TYDOM programme (read-only)**
+and choose your integration entry. The action requires a response variable,
+including in Developer tools. Use YAML mode there, or a script or automation:
+
+```yaml
+action: deltadore_tydom.get_schedule
+data:
+  config_entry_id: YOUR_TYDOM_CONFIG_ENTRY_ID
+response_variable: tydom_programme
+```
+
+The response contains `config_entry_id`, `scope: gateway`, `source: /moments/file`
+and `schedule`. The last field contains the original JSON document, including
+shared routines and any device, group, area, scenario or recurrence references.
+It is **not** a thermostat-specific weekly dictionary: different gateway
+versions may use different file structures. For a JSON export, use
+`{{ tydom_programme.schedule | to_json }}` in a subsequent script step.
+
+Each explicit call reads the gateway again, even if an earlier background
+request received a `404`. Missing files, rejected requests and timeouts are
+reported as errors, not as an empty programme; the action never creates a file.
+A `404` alone does not establish whether a thermostat has its own programme.
+When sharing a snapshot, remove private names, identifiers and location data,
+using consistent replacements so that references remain understandable.
+
 ## Known limitations
 
 - Dry-contact TYXIA 4620 gate and garage configurations provide an impulse
@@ -645,8 +865,10 @@ reported arm or disarm transition.
   Refreshing or polling the gateway cannot force a sleeping device to transmit
   a newer value.
 - An exact model name is displayed only when TYDOM provides reliable product or
-  tutorial metadata. Other compatible devices retain a generic Delta Dore
-  model name rather than being guessed from broad capabilities.
+  tutorial metadata. For example, identifying a Tybox Home RF 210 from its
+  tutorial metadata names the model but does not confirm that every register,
+  preset or control is supported. Other compatible devices retain a generic
+  Delta Dore model name rather than being guessed from broad capabilities.
 - The capture tool records messages returned or published by the gateway. It
   cannot always reveal the exact outbound request sent by the official mobile
   application.

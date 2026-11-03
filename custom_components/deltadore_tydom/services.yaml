@@ -1,3 +1,14 @@
+get_schedule:
+  name: Get TYDOM programme (read-only)
+  description: Experimental read-only snapshot of the complete gateway programming document. Returns the original data, including shared routines, without converting it to a thermostat-specific weekly plan or modifying anything. Requires a response variable.
+  fields:
+    config_entry_id:
+      name: TYDOM integration entry
+      description: Gateway whose programming document should be read.
+      required: true
+      selector:
+        config_entry:
+          integration: deltadore_tydom
 acknowledge_events:
   name: Acknowledge alarm events
   description: Acknowledge all unacknowledged alarm events.
@@ -135,6 +146,34 @@ remove_product_association:
       required: true
       selector:
         boolean:
+set_mode_using_stored_pin:
+  name: Set alarm mode using the stored PIN
+  description: >-
+    Arm or disarm using the alarm PIN saved in this alarm's TYDOM integration
+    settings. Intended for Home Assistant automations without a duplicated
+    PIN. This action does not change the alarm panel's code request and never
+    forces arming despite defects. Callers authorised to run this action can
+    control the alarm without entering the PIN again.
+  target:
+    entity:
+      integration: deltadore_tydom
+      domain: alarm_control_panel
+  fields:
+    mode:
+      name: Alarm mode
+      description: Use the configured Away, Home or Night zones, or disarm the alarm.
+      required: true
+      selector:
+        select:
+          options:
+            - label: Away
+              value: away
+            - label: Home
+              value: home
+            - label: Night
+              value: night
+            - label: Disarm
+              value: disarm
 force_arm:
   name: Force arm alarm
   description: Explicitly force the selected alarm mode despite defects that caused normal arming to be refused. Use only after checking those defects.
