@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import copy
+import inspect
 import json
 import re
 import time
@@ -39,6 +40,7 @@ from .tydom_devices import (
     TydomScene,
     is_binary_tyxia_receiver_profile,
     is_physical_tywell_control_profile,
+    is_tywell_control_type,
     resolve_device_model,
 )
 
@@ -64,7 +66,12 @@ _MAX_REPLIES_SIZE = 5
 _ENDPOINT_WARNING_MILESTONES = {1, 10, 100, 1000}
 """Per-session endpoint issue counts which remain visible as warnings."""
 
-_OPTIONAL_PATHS = frozenset({"/moments/file", "/scenarios/file"})
+_CLIMATE_META_KEYS = frozenset({"heatSetpoint", "coolSetpoint", "thermicLevel"})
+"""Thermostat-only endpoint metadata keys that cannot describe a conso endpoint."""
+
+_OPTIONAL_PATHS = frozenset(
+    {"/moments/file", "/scenarios/file", "/home/hvac/data", "/home/absence"}
+)
 """Feature endpoints absent from some older TYDOM gateway firmware."""
 
 _HISTO_END_INDEX = 255
@@ -116,7 +123,7 @@ def _parse_energy_cdata_element(element: Any) -> dict[str, int | float]:
             return {}
         return {f"{name}_{unit}": measure / _ENERGY_INSTANT_DIVISORS[unit]}
 
-    if name in {"energyDistrib", "energyHisto"}:
+    if name == "energyDistrib":
         return {
             f"{name}_{key}": value
             for key, value in values.items()
@@ -269,6 +276,7 @@ scenario_metadata = {}  # Store scenario metadata from /configs/file
 groups_metadata = {}  # Store group metadata from /configs/file: {group_id: {"usage": "light", "name": "TOTAL"}}
 groups_data = {}  # Store groups data: {group_id: {"devices": [device_ids], "name": group_name}}
 endpoint_config = {}  # Store endpoint-specific configuration from /configs/file
+removed_configured_radio_endpoint_uids: set[str] = set()
 remote_control_info = {}  # Store physical remote and button details by endpoint UID
 # Complete file snapshots are required when the gateway configuration must be
 # updated.  The normal lookup dictionaries above intentionally retain only the
@@ -366,11 +374,12 @@ def _refresh_remote_control_info() -> None:
 
 @dataclass(frozen=True)
 class AreaDeviceReference:
-    """Identify the device endpoint whose state is backed by an area."""
+    """Identify a device endpoint receiving area state or telemetry."""
 
     uid: str
     device_id: str
     endpoint_id: str
+    telemetry_only: bool = False
 
 
 _AREA_CONTROL_ATTRIBUTES = {
@@ -378,6 +387,12 @@ _AREA_CONTROL_ATTRIBUTES = {
     "setpoint",
     "heatSetpoint",
     "coolSetpoint",
+}
+
+_AREA_TELEMETRY_ATTRIBUTES = {
+    "hygroIn",
+    "anticipcoeff",
+    "anticpcoeff",
 }
 
 
@@ -541,6 +556,24 @@ def _refresh_interrupter_info() -> None:
             }
 
 
+def _has_writable_comfort_mode(metadata: dict[str, Any] | None) -> bool:
+    """Return whether an endpoint drives its own thermostat via comfortMode.
+
+    A writable ``comfortMode`` register means the endpoint accepts heat/cool/
+    stop commands directly and reports its own mode and setpoints. Such a
+    thermostat is authoritative on its own endpoint and must not be treated as a
+    passive member of the area it is grouped into. (#463, Tybox Home RF 210)
+    """
+    if not isinstance(metadata, dict):
+        return False
+    comfort_mode = metadata.get("comfortMode")
+    return (
+        isinstance(comfort_mode, dict)
+        and "w" in comfort_mode.get("permission", "")
+        and bool(comfort_mode.get("enum_values"))
+    )
+
+
 class MessageHandler:
     """Handle incoming Tydom messages."""
 
@@ -550,10 +583,12 @@ class MessageHandler:
         self.cmd_prefix = cmd_prefix
         self._cdata_replies: list[Reply] = []
         self._end_reply_events: dict[str, asyncio.Event] = {}
+        self._cdata_poll_events: dict[str, asyncio.Event] = {}
         self._reply_errors: dict[str, str] = {}
         self._alarm_command_waiters: dict[
             tuple[str, str, str], list[asyncio.Future[dict[str, Any]]]
         ] = {}
+        self._home_zone_state: dict[tuple[str, str], Any] = {}
         self._area_devices: dict[str, dict[str, AreaDeviceReference]] = {}
         self._area_data: dict[str, dict[str, Any]] = {}
         self._area_metadata: dict[str, dict] = {}
@@ -566,6 +601,7 @@ class MessageHandler:
         issue: str,
         detail: Any,
         name: str,
+        resolution: str = "retaining the previous state",
     ) -> None:
         """Rate-limit a repeated endpoint problem while retaining diagnostics."""
         key = (device_id, endpoint_id, issue, detail)
@@ -579,13 +615,14 @@ class MessageHandler:
         )
         log(
             "TYDOM endpoint %s: device_id=%s, endpoint_id=%s, name=%s, "
-            "detail=%s, occurrences=%s; retaining the previous state",
+            "detail=%s, occurrences=%s; %s",
             issue,
             device_id,
             endpoint_id,
             name,
             detail,
             occurrences,
+            resolution,
         )
 
     def get_reply(self, transaction_id: str) -> Reply | None:
@@ -644,6 +681,21 @@ class MessageHandler:
     def get_reply_error(self, transaction_id: str) -> str | None:
         """Return and forget a protocol error for one pending request."""
         return self._reply_errors.pop(transaction_id, None)
+
+    def register_cdata_poll(self, transaction_id: str) -> asyncio.Event:
+        """Register a waiter completed by the cdata stream's EOR marker."""
+        event = asyncio.Event()
+        self._cdata_poll_events[transaction_id] = event
+        return event
+
+    def complete_cdata_poll(self, transaction_id: str) -> None:
+        """Complete a pending cdata poll after its stream has ended."""
+        if event := self._cdata_poll_events.pop(transaction_id, None):
+            event.set()
+
+    def remove_cdata_poll(self, transaction_id: str) -> None:
+        """Remove a cdata poll waiter after completion or timeout."""
+        self._cdata_poll_events.pop(transaction_id, None)
 
     def create_alarm_command_waiter(
         self, device_id: str, endpoint_id: str, command: str
@@ -735,6 +787,8 @@ class MessageHandler:
             transaction_id = parsed_message.headers.get("Transac-Id")
 
             if status is not None and status >= 400:
+                if transaction_id:
+                    self.complete_cdata_poll(transaction_id)
                 if status == 404 and uri_origin in _OPTIONAL_PATHS:
                     self.tydom_client.mark_optional_path_unsupported(uri_origin)
                     LOGGER.debug(
@@ -771,10 +825,6 @@ class MessageHandler:
                 # body while the updated state arrives in a separate push. This
                 # also happens for requests using the gateway's reserved
                 # transaction id "0", which are not tracked as pending replies.
-                # Complete tracked requests immediately on empty ACK to avoid
-                # waiting for the full client timeout.
-                if transaction_id:
-                    self._complete_empty_cdata_reply(transaction_id)
                 # A ping is itself completed by this empty 200 response, so it
                 # must still reach the liveness bookkeeping even though there is
                 # no body to parse.
@@ -909,12 +959,20 @@ class MessageHandler:
         async def event_message(*args):
             LOGGER.debug("Event message, refreshing...")
             await self.tydom_client.get_devices_data()
+            refresh = getattr(self.tydom_client, "get_home_climate_data", None)
+            if inspect.iscoroutinefunction(refresh):
+                await refresh()
 
         async def ping_message(*args):
             self.tydom_client.receive_pong()
 
+        async def home_climate_message(resource: str, parsed, *_args):
+            self.tydom_client.general_climate.update(resource, parsed)
+
         MSG_MAPPING = {
             "/areas/data": self.parse_areas_data,
+            "/home/hvac/data": partial(home_climate_message, "hvac"),
+            "/home/absence": partial(home_climate_message, "absence"),
             "/configs/file": MessageHandler.parse_config_data,
             "/configs/gateway/api_mode": partial(no_op, "msg_api_mode"),
             "/devices/data": self.parse_devices_data,
@@ -1054,7 +1112,14 @@ class MessageHandler:
         match last_usage:
             case "shutter" | "klineShutter" | "awning" | "swingShutter":
                 return TydomShutter(
-                    tydom_client, uid, device_id, name, last_usage, endpoint, None, data
+                    tydom_client,
+                    uid,
+                    device_id,
+                    name,
+                    last_usage,
+                    endpoint,
+                    device_metadata.get(uid),
+                    data,
                 )
             case (
                 "window"
@@ -1084,7 +1149,7 @@ class MessageHandler:
                     device_metadata.get(uid),
                     data,
                 )
-            case "garage_door":
+            case "garage_door" | "garage_door_horizontal":
                 return TydomGarage(
                     tydom_client,
                     uid,
@@ -1240,11 +1305,15 @@ class MessageHandler:
                         device_metadata.get(controller_uid),
                     )
                 ]
-                if len(physical_controllers) == 1:
-                    controller_uid = physical_controllers[0]
-                    weather_device.group_with_registry_device(
-                        controller_uid,
-                        device_name.get(controller_uid, "Tywell Control"),
+                if physical_controllers:
+                    weather_device.group_with_registry_devices(
+                        [
+                            (
+                                controller_uid,
+                                device_name.get(controller_uid, "Tywell Control"),
+                            )
+                            for controller_uid in physical_controllers
+                        ]
                     )
                 return weather_device
             case "sensorDF":
@@ -1347,6 +1416,22 @@ class MessageHandler:
         # removed from the gateway configuration keeps its old name/type and is
         # recreated during the following device-data refresh.
         previous_configured_uids = set(endpoint_config)
+        current_configured_uids = {
+            f"{endpoint['id_endpoint']}_{endpoint['id_device']}"
+            for endpoint in parsed.get("endpoints", [])
+            if isinstance(endpoint, dict)
+            and "id_endpoint" in endpoint
+            and "id_device" in endpoint
+        }
+        removed_configured_radio_endpoint_uids.update(
+            unique_id
+            for unique_id in previous_configured_uids - current_configured_uids
+            if endpoint_config[unique_id].get("usage")
+            in {"remoteControl", "interrupter"}
+        )
+        removed_configured_radio_endpoint_uids.difference_update(
+            current_configured_uids
+        )
         for unique_id in previous_configured_uids:
             device_name.pop(unique_id, None)
             device_type.pop(unique_id, None)
@@ -1505,22 +1590,6 @@ class MessageHandler:
                                         )
                                         self.tydom_client.add_poll_device_url_5m(url)
                                         LOGGER.debug("Add poll device : " + url)
-                        elif elem["name"] == "energyHisto":
-                            for params in elem["parameters"]:
-                                if params["name"] == "dest":
-                                    for dest in params["enum_values"]:
-                                        url = (
-                                            "/devices/"
-                                            + str(i["id"])
-                                            + "/endpoints/"
-                                            + str(endpoint["id"])
-                                            + "/cdata?name="
-                                            + elem["name"]
-                                            + "&period=YEAR&periodOffset=0&dest="
-                                            + dest
-                                        )
-                                        self.tydom_client.add_poll_device_url_5m(url)
-                                        LOGGER.debug("Add poll device : " + url)
                         elif elem["name"] == "energyDistrib":
                             for params in elem["parameters"]:
                                 if params["name"] == "src":
@@ -1551,6 +1620,25 @@ class MessageHandler:
             # logging one "Unsupported message" warning per key.
             parsed = [parsed]
 
+        refresh_home = False
+        for record in parsed:
+            if not isinstance(record, dict):
+                continue
+            for endpoint in record.get("endpoints", []):
+                uid = f"{endpoint.get('id')}_{record.get('id')}"
+                for item in endpoint.get("data", []):
+                    name = item.get("name")
+                    if name not in {"authorization", "localMode", "thermicLevel"}:
+                        continue
+                    key = (uid, name)
+                    value = item.get("value")
+                    if (
+                        key in self._home_zone_state
+                        and self._home_zone_state[key] != value
+                    ):
+                        refresh_home = True
+                    self._home_zone_state[key] = value
+
         for area_id, metadata in _area_control_metadata(parsed).items():
             if _area_metadata_score(metadata) >= _area_metadata_score(
                 self._area_metadata.get(area_id, {})
@@ -1564,6 +1652,13 @@ class MessageHandler:
                 for endpoint in i["endpoints"]:
                     endpoint_id = endpoint["id"]
                     unique_id = str(endpoint_id) + "_" + str(device_id)
+                    if unique_id in removed_configured_radio_endpoint_uids:
+                        LOGGER.debug(
+                            "Ignoring radio data for removed configured endpoint %s",
+                            unique_id,
+                        )
+                        continue
+
                     known_pending_endpoints = getattr(
                         self.tydom_client,
                         "_configless_remote_known_endpoint_ids",
@@ -1802,7 +1897,46 @@ class MessageHandler:
                         for elem in endpoint.get("data", [])
                         if elem.get("validity") == "upToDate"
                     ]
+                    # Gateway firmware quirk (issue #507): a periodic full
+                    # refresh can report the frost-protection sub-block before
+                    # it is populated — antiFrostSetpoint comes back null while
+                    # antiFrostWhenOff defaults to false, both flagged
+                    # "upToDate". A correcting frame restores the real values a
+                    # few seconds later. Applying the transient false makes the
+                    # "Frost protection" binary sensor flap, so drop
+                    # antiFrostWhenOff whenever it arrives with a null
+                    # antiFrostSetpoint in the same frame.
+                    if any(
+                        elem.get("name") == "antiFrostSetpoint"
+                        and elem.get("value") is None
+                        for elem in valid_data
+                    ):
+                        valid_data = [
+                            elem
+                            for elem in valid_data
+                            if elem.get("name") != "antiFrostWhenOff"
+                        ]
                     has_valid_data = bool(valid_data)
+
+                    # Some TYWATT/Calybox gateways advertise phantom consumption
+                    # endpoints with a thermostat profile in /devices/meta.
+                    # The real meter has no such profile and provides its
+                    # readings through /cdata. Command metadata in
+                    # /devices/cmeta may be empty for the phantom endpoints.
+                    endpoint_metadata = device_metadata.get(unique_id) or {}
+                    if type_of_id == "conso" and _CLIMATE_META_KEYS.intersection(
+                        endpoint_metadata
+                    ):
+                        self._record_endpoint_issue(
+                            device_id,
+                            endpoint_id,
+                            "is a mis-advertised consumption endpoint "
+                            "(thermostat metadata)",
+                            None,
+                            name_of_id,
+                            resolution="skipping entity creation",
+                        )
+                        continue
 
                     # Some Zigbee gateways advertise a second, non-functional
                     # endpoint for each physical cover.  A successful endpoint
@@ -1864,9 +1998,26 @@ class MessageHandler:
                     try:
                         data = {}
                         area_id = None
+                        area_telemetry_only = False
                         passive_climate_uid = None
 
                         link = endpoint.get("link")
+                        # An endpoint that exposes a writable ``comfortMode``
+                        # drives its own thermostat (heat/cool/stop) directly, so
+                        # its ``/devices/data`` state and setpoints are
+                        # authoritative. Keep its thermostat control on that
+                        # endpoint; the linked area aggregates a zone and can
+                        # report a different/stale mode (e.g. a Tybox Home RF
+                        # 210 reporting COOLING while the area still reads
+                        # HEATING). Its sensor telemetry can still be useful.
+                        # (#463)
+                        # RE2020 wall controllers operate their linked area,
+                        # even when their endpoint advertises comfortMode.
+                        # Independent Tybox/Typass thermostats retain endpoint
+                        # ownership and their own mode feedback (#463).
+                        endpoint_controls_own_thermostat = not is_tywell_control_type(
+                            type_of_id
+                        ) and _has_writable_comfort_mode(device_metadata.get(unique_id))
                         if (
                             isinstance(link, dict)
                             and link.get("type") == "area"
@@ -1887,17 +2038,26 @@ class MessageHandler:
                                         area_id, device_metadata.get(unique_id, {})
                                     ).copy()
                                 )
+                            elif endpoint_controls_own_thermostat:
+                                # Keep thermostat control on the physical endpoint,
+                                # while retaining the area link for its read-only
+                                # sensor data and diagnostic identifier.
+                                data["area_id"] = area_id
+                                data["_endpoint_controls_own_thermostat"] = True
+                                area_telemetry_only = True
                             else:
                                 data["area_id"] = area_id
 
-                            reference = AreaDeviceReference(
-                                uid=reference_uid,
-                                device_id=str(device_id),
-                                endpoint_id=str(endpoint_id),
-                            )
-                            self._area_devices.setdefault(area_id, {})[
-                                reference_uid
-                            ] = reference
+                            if area_id is not None:
+                                reference = AreaDeviceReference(
+                                    uid=reference_uid,
+                                    device_id=str(device_id),
+                                    endpoint_id=str(endpoint_id),
+                                    telemetry_only=area_telemetry_only,
+                                )
+                                self._area_devices.setdefault(area_id, {})[
+                                    reference_uid
+                                ] = reference
 
                         # Endpoint-level errors can accompany usable values. Trust
                         # each field's validity instead of discarding the full payload.
@@ -1912,7 +2072,17 @@ class MessageHandler:
                             and area_id in self._area_data
                             and passive_climate_uid is None
                         ):
-                            data.update(self._area_data[area_id])
+                            if area_telemetry_only:
+                                for attribute in _AREA_TELEMETRY_ATTRIBUTES:
+                                    if (
+                                        attribute not in data
+                                        and attribute in self._area_data[area_id]
+                                    ):
+                                        data[attribute] = self._area_data[area_id][
+                                            attribute
+                                        ]
+                            else:
+                                data.update(self._area_data[area_id])
 
                         # Create the device (even without data)
                         device = await MessageHandler.get_device(
@@ -2000,6 +2170,12 @@ class MessageHandler:
                         )
             else:
                 LOGGER.warning("Unsupported message received: %s", parsed)
+        # Zone authorisation and general absence can change through the app or
+        # a physical controller without a /home/* push. Read the general state;
+        # never infer it from a zone's activity or from a frost-protection value.
+        refresh = getattr(self.tydom_client, "get_home_climate_data", None)
+        if refresh_home and inspect.iscoroutinefunction(refresh):
+            await refresh()
         return devices
 
     async def parse_areas_data(
@@ -2051,6 +2227,16 @@ class MessageHandler:
             data = cached_data.copy()
 
             for reference in references.values():
+                device_data = data
+                if reference.telemetry_only:
+                    device_data = {
+                        attribute: value
+                        for attribute, value in data.items()
+                        if attribute in _AREA_TELEMETRY_ATTRIBUTES
+                    }
+                    if not device_data:
+                        continue
+
                 device = await MessageHandler.get_device(
                     self.tydom_client,
                     self.get_type_from_id(reference.uid),
@@ -2058,7 +2244,7 @@ class MessageHandler:
                     reference.device_id,
                     self.get_name_from_id(reference.uid),
                     reference.endpoint_id,
-                    data,
+                    device_data,
                 )
                 if device is not None:
                     devices.append(device)
@@ -2076,9 +2262,14 @@ class MessageHandler:
         """Parse devices cdata."""
         LOGGER.debug("parse_devices_cdata : %s", parsed)
         devices = []
+        cdata_poll_complete = False
 
         for i in parsed:
             for endpoint in i["endpoints"]:
+                if endpoint["error"] != 0:
+                    cdata_poll_complete = True
+                    continue
+
                 if endpoint["error"] == 0 and len(endpoint["cdata"]) > 0:
                     try:
                         device_id = i["id"]
@@ -2090,6 +2281,9 @@ class MessageHandler:
                         data = {}
 
                         for elem in endpoint["cdata"]:
+                            if elem.get("EOR", False):
+                                cdata_poll_complete = True
+
                             if type_of_id == "alarm":
                                 self._resolve_alarm_command_waiter(
                                     device_id, endpoint_id, elem
@@ -2207,6 +2401,10 @@ class MessageHandler:
                                 )
                     except Exception as e:
                         LOGGER.exception("Error when parsing msg_cdata", exc_info=e)
+
+        if transaction_id and cdata_poll_complete:
+            self.complete_cdata_poll(transaction_id)
+
         return devices
 
     async def parse_scenarios_file(self, parsed, transaction_id):

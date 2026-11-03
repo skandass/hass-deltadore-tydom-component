@@ -67,9 +67,7 @@ is_trv_1_profile = devices_module.is_trv_1_profile
 is_tymoov_profile = devices_module.is_tymoov_profile
 is_tybox_1137_profile = devices_module.is_tybox_1137_profile
 is_tyxia_dimmer_profile = devices_module.is_tyxia_dimmer_profile
-is_physical_tywell_control_profile = (
-    devices_module.is_physical_tywell_control_profile
-)
+is_physical_tywell_control_profile = devices_module.is_physical_tywell_control_profile
 resolve_device_model = devices_module.resolve_device_model
 MessageHandler = handler_module.MessageHandler
 
@@ -110,6 +108,7 @@ class TestDeviceModels(TestCase):
             "switch_tyxia2600_btn_a": "TYXIA 2600",
             "rcu_tyxia1410_btn_4": "TYXIA 1410",
             "tl2000_btn_2": "TL 2000 Tyxal+",
+            "tybox_210_rf": "Tybox Home RF 210",
             "Tywatt_serie1000": "TYWATT 1000",
             "Volet_roulant_wellcom": "Well'com roller shutter",
         }
@@ -133,6 +132,18 @@ class TestDeviceModels(TestCase):
                 None,
                 "re2020ControlPassive",
                 {"hygroIn": {"permission": "r"}},
+            )
+        )
+        self.assertTrue(
+            is_physical_tywell_control_profile(
+                None,
+                "re2020Controller",
+            )
+        )
+        self.assertTrue(
+            is_physical_tywell_control_profile(
+                "tywell_control",
+                "unknown-controller-profile",
             )
         )
         self.assertFalse(
@@ -335,6 +346,27 @@ class TestDeviceModelApplication(IsolatedAsyncioTestCase):
         handler_module.endpoint_config.clear()
         self.handler = MessageHandler(MagicMock(), b"")
 
+    async def test_shutter_retains_gateway_metadata_for_favourite_commands(
+        self,
+    ) -> None:
+        """Shutter devices keep advertised command capabilities."""
+        uid = "20_10"
+        metadata = {
+            "positionCmd": {
+                "permission": "w",
+                "enum_values": ["DOWN", "UP", "STOP", "FAVORIT1", "FAVORIT2"],
+            }
+        }
+        handler_module.device_metadata[uid] = metadata
+
+        device = await MessageHandler.get_device(
+            MagicMock(), "shutter", uid, "10", "Cover", "20", {"position": 50}
+        )
+
+        self.assertIsInstance(device, devices_module.TydomShutter)
+        self.assertEqual(device._metadata, metadata)
+        self.assertEqual(device.favourite_commands, frozenset({"FAVORIT1", "FAVORIT2"}))
+
     async def test_resolved_model_is_added_to_device_data(self) -> None:
         """A descriptor-derived model is exposed through productName."""
         uid = "20_10"
@@ -364,6 +396,21 @@ class TestDeviceModelApplication(IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(device)
         self.assertEqual(device.productName, "Reported model")
+
+    async def test_horizontal_garage_door_usage_is_recognized_as_garage(self) -> None:
+        """TYDOM reports some garage openers with a distinct usage string.
+
+        A horizontal/sliding motor is reported as ``garage_door_horizontal``
+        rather than ``garage_door``, but advertises the same ``level`` and
+        ``levelCmd`` capabilities, so it must resolve to the same TydomGarage
+        cover instead of falling back to a generic device.
+        """
+        device = await MessageHandler.get_device(
+            MagicMock(), "garage_door_horizontal", "41_40", "40", "Garage", "41"
+        )
+
+        self.assertIsNotNone(device)
+        self.assertIsInstance(device, devices_module.TydomGarage)
 
     async def test_separately_paired_tyxia_2600_is_identified(self) -> None:
         """The observed two-record pairing retains its physical model."""

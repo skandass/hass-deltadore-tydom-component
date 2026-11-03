@@ -23,7 +23,7 @@ def _load_ha_entity_class():
         for node in module.body
         if (
             isinstance(node, ast.FunctionDef)
-            and node.name == "_get_hub_for_tydom_device"
+            and node.name in {"_get_hub_for_tydom_device", "_get_entity_registry_api"}
         )
         or (isinstance(node, ast.ClassDef) and node.name == "HAEntity")
     ]
@@ -41,12 +41,13 @@ def _load_ha_entity_class():
     ast.fix_missing_locations(isolated_module)
 
     class GenericBinarySensor:
-        def __init__(self, *_args) -> None:
-            pass
+        def __init__(self, *_args, **kwargs) -> None:
+            self.registry_kwargs = kwargs
 
     class GenericSensor:
-        def __init__(self, *_args) -> None:
-            pass
+        def __init__(self, *_args, **kwargs) -> None:
+            self._attribute = _args[4]
+            self.registry_kwargs = kwargs
 
     class BinarySensorDeviceClass:
         PROBLEM = "problem"
@@ -58,6 +59,10 @@ def _load_ha_entity_class():
         "LOGGER": MagicMock(),
         "GenericBinarySensor": GenericBinarySensor,
         "GenericSensor": GenericSensor,
+        "_get_entity_registry_api": lambda: SimpleNamespace(
+            async_get=lambda _hass: object(),
+            async_entries_for_config_entry=lambda _registry, _entry_id: [],
+        ),
         "is_binary_attribute": lambda _device, _attribute, value, _class: isinstance(
             value, bool
         ),
@@ -84,7 +89,11 @@ def _load_gateway_registry_helper(registry):
         for node in module.body
         if isinstance(node, ast.FunctionDef)
         and node.name
-        in {"_get_hub_for_tydom_device", "_get_tydom_gateway_registry_device_id"}
+        in {
+            "_get_hub_for_tydom_device",
+            "_get_tydom_gateway_registry_device_id",
+            "_get_tydom_registry_device_id",
+        }
     ]
     isolated_module = ast.Module(
         body=[
@@ -109,7 +118,11 @@ def _load_gateway_registry_helper(registry):
         "dr": registry,
     }
     exec(compile(isolated_module, source_path, "exec"), namespace)
-    return namespace["_get_tydom_gateway_registry_device_id"], Tydom
+    return (
+        namespace["_get_tydom_gateway_registry_device_id"],
+        namespace["_get_tydom_registry_device_id"],
+        Tydom,
+    )
 
 
 class TestGatewayRegistryLink(TestCase):
@@ -119,7 +132,7 @@ class TestGatewayRegistryLink(TestCase):
         """A child device never looks up a same-named gateway in another entry."""
         registry = MagicMock()
         registry.async_get_device_id_by_identifier.return_value = "registry-gateway"
-        helper, Tydom = _load_gateway_registry_helper(registry)
+        helper, _device_helper, Tydom = _load_gateway_registry_helper(registry)
         client = object()
         gateway = Tydom()
         gateway.device_id = "gateway-id"
@@ -142,7 +155,7 @@ class TestGatewayRegistryLink(TestCase):
         """A startup ordering race leaves the optional parent link unset."""
         registry = MagicMock()
         registry.async_get_device_id_by_identifier.side_effect = ValueError
-        helper, Tydom = _load_gateway_registry_helper(registry)
+        helper, _device_helper, Tydom = _load_gateway_registry_helper(registry)
         client = object()
         gateway = Tydom()
         gateway.device_id = "gateway-id"
@@ -154,6 +167,31 @@ class TestGatewayRegistryLink(TestCase):
         hass = SimpleNamespace(data={"deltadore_tydom": {"entry-a": hub}})
 
         self.assertIsNone(helper(hass, SimpleNamespace(_tydom_client=client)))
+
+    def test_resolves_weather_parent_in_owning_config_entry(self) -> None:
+        """Weather child devices link only to their own controller registry."""
+        registry = MagicMock()
+        registry.async_get_device_id_by_identifier.return_value = "registry-controller"
+        _gateway_helper, helper, Tydom = _load_gateway_registry_helper(registry)
+        client = object()
+        gateway = Tydom()
+        gateway.device_id = "gateway-id"
+        hub = SimpleNamespace(
+            _entry=SimpleNamespace(entry_id="entry-a"),
+            _tydom_client=client,
+            devices={"gateway-id": gateway},
+        )
+        hass = SimpleNamespace(data={"deltadore_tydom": {"entry-a": hub}})
+
+        self.assertEqual(
+            helper(hass, SimpleNamespace(_tydom_client=client), "controller-id"),
+            "registry-controller",
+        )
+        registry.async_get_device_id_by_identifier.assert_called_once_with(
+            hass,
+            ("deltadore_tydom", "controller-id"),
+            config_entry_id="entry-a",
+        )
 
 
 def _load_opening_consumed_attrs():
@@ -171,8 +209,7 @@ def _load_opening_consumed_attrs():
         if (
             isinstance(node, ast.Assign)
             and any(
-                isinstance(target, ast.Name)
-                and target.id == "_BINARY_OPEN_STATES"
+                isinstance(target, ast.Name) and target.id == "_BINARY_OPEN_STATES"
                 for target in node.targets
             )
         )
@@ -221,6 +258,15 @@ class EntitySensorRegistrationTests(TestCase):
             entity._registered_sensors = []
         return entity
 
+    def test_device_info_keeps_explicit_parent_link(self) -> None:
+        """A controller parent must not be overwritten by the gateway link."""
+        entity = self._entity("weather_endpoint")
+        entity._get_tydom_gateway_device_id = MagicMock(return_value="gateway-id")
+        device_info = {"via_device_id": "controller-registry-id"}
+
+        self.assertIs(entity._enrich_device_info(device_info), device_info)
+        entity._get_tydom_gateway_device_id.assert_not_called()
+
     def test_same_attribute_is_registered_for_each_device(self) -> None:
         """One device must not suppress a matching sensor on another device."""
         first = self._entity("gate_1")
@@ -253,6 +299,83 @@ class EntitySensorRegistrationTests(TestCase):
         entity = self._entity("gate_1")
 
         self.assertEqual(len(entity.get_sensors()), 1)
+        self.assertEqual(entity.get_sensors(), [])
+
+    def test_registered_supported_sensor_returns_when_live_value_is_missing(
+        self,
+    ) -> None:
+        """A restart must not orphan a known humidity entity on an empty payload."""
+        entity = self._entity("boiler_1")
+        del entity._device.thermicDefect
+        entity.hass = object()
+        entity.sensor_classes = {"hygroIn": "humidity"}
+        entity.units = {"hygroIn": "%"}
+        entity._get_hub = MagicMock(
+            return_value=SimpleNamespace(_entry=SimpleNamespace(entry_id="entry-a"))
+        )
+        registry = object()
+        registry_entries = [
+            SimpleNamespace(
+                domain="sensor",
+                platform="deltadore_tydom",
+                unique_id="boiler_1_hygroIn",
+            ),
+            SimpleNamespace(
+                domain="sensor",
+                platform="deltadore_tydom",
+                unique_id="boiler_1_removedField",
+            ),
+        ]
+        registry_api = SimpleNamespace(
+            async_get=MagicMock(return_value=registry),
+            async_entries_for_config_entry=MagicMock(return_value=registry_entries),
+        )
+        namespace = HAEntity.get_sensors.__globals__
+        previous_registry_api = namespace["_get_entity_registry_api"]
+        namespace["_get_entity_registry_api"] = lambda: registry_api
+        try:
+            sensors = entity.get_sensors()
+        finally:
+            namespace["_get_entity_registry_api"] = previous_registry_api
+
+        self.assertEqual([sensor._attribute for sensor in sensors], ["hygroIn"])
+        self.assertEqual(entity._registered_sensors, ["hygroIn"])
+        registry_api.async_get.assert_called_once_with(entity.hass)
+        registry_api.async_entries_for_config_entry.assert_called_once_with(
+            registry, "entry-a"
+        )
+
+    def test_shared_weather_sensor_is_registered_once_on_weather_device(self) -> None:
+        """A source shared by controllers gets one sensor on one Weather device."""
+        entity = self._entity("weather_1")
+        del entity._device.thermicDefect
+        entity._device.outTemperature = 18.5
+        entity._sensor_registry_targets = (
+            (
+                "weather_endpoint",
+                "Weather",
+                "",
+                None,
+            ),
+        )
+        entity._registry_device_id_override = "weather_endpoint"
+        entity._registry_translation_key_override = "tywell_weather"
+
+        sensors = entity.get_sensors()
+
+        self.assertEqual(len(sensors), 1)
+        self.assertEqual(
+            [sensor.registry_kwargs for sensor in sensors],
+            [
+                {
+                    "registry_device_id": "weather_endpoint",
+                    "registry_device_name": "Weather",
+                    "registry_parent_device_id": None,
+                    "registry_translation_key": "tywell_weather",
+                    "unique_id_suffix": "",
+                },
+            ],
+        )
         self.assertEqual(entity.get_sensors(), [])
 
     def test_registration_lists_are_not_shared(self) -> None:
@@ -383,9 +506,7 @@ class EntitySensorRegistrationTests(TestCase):
     def test_binary_open_state_is_consumed(self) -> None:
         """A two-state openState adds nothing beyond the primary entity."""
         device = MagicMock()
-        device._metadata = {
-            "openState": {"enum_values": ["LOCKED", "UNLOCKED"]}
-        }
+        device._metadata = {"openState": {"enum_values": ["LOCKED", "UNLOCKED"]}}
 
         self.assertEqual(
             get_consumed_opening_attrs(device),
@@ -396,9 +517,7 @@ class EntitySensorRegistrationTests(TestCase):
         """French-window opening modes must remain separately observable."""
         device = MagicMock()
         device._metadata = {
-            "openState": {
-                "enum_values": ["LOCKED", "OPEN_FRENCH", "OPEN_HOPPER"]
-            }
+            "openState": {"enum_values": ["LOCKED", "OPEN_FRENCH", "OPEN_HOPPER"]}
         }
 
         self.assertEqual(

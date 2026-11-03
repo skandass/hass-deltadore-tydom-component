@@ -253,6 +253,94 @@ class LevelCommandCoverTests(IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_shutter_position_ignores_coarse_metadata_step(self) -> None:
+        """Intermediate HA targets remain writable when TYDOM advertises step 100."""
+        client = MagicMock()
+        client.put_devices_data = AsyncMock()
+        shutter = TydomShutter(
+            client,
+            "10_20",
+            "20",
+            "Cover",
+            "shutter",
+            "10",
+            {
+                "position": {"min": 0, "max": 100, "step": 100},
+                "positionCmd": {"permission": "w"},
+            },
+            {"position": 0},
+        )
+        validator = devices_module.validate_value_with_metadata
+        validator.reset_mock()
+
+        await shutter.set_position(25)
+
+        validator.assert_called_once_with(shutter, "position", 25, ignore_step=True)
+        client.put_devices_data.assert_awaited_once_with("20", "10", "position", "25")
+
+
+class ShutterFavouritePositionTests(IsolatedAsyncioTestCase):
+    """Exercise TYDOM favourite-position commands."""
+
+    async def test_recall_uses_only_advertised_favourite_commands(self) -> None:
+        """Both favourite slots are sent through positionCmd."""
+        client = MagicMock()
+        client.put_devices_data = AsyncMock()
+        device = TydomShutter(
+            client,
+            "10_20",
+            "20",
+            "Cover",
+            "shutter",
+            "10",
+            {
+                "positionCmd": {
+                    "permission": "w",
+                    "enum_values": ["DOWN", "UP", "FAVORIT1", "FAVORIT2"],
+                }
+            },
+            {"position": 50},
+        )
+
+        self.assertEqual(device.favourite_commands, frozenset({"FAVORIT1", "FAVORIT2"}))
+        await device.recall_favourite_position(1)
+        await device.recall_favourite_position(2)
+
+        self.assertEqual(
+            client.put_devices_data.await_args_list,
+            [
+                call("20", "10", "positionCmd", "FAVORIT1"),
+                call("20", "10", "positionCmd", "FAVORIT2"),
+            ],
+        )
+
+    async def test_recall_rejects_unadvertised_or_read_only_commands(self) -> None:
+        """Unsupported slots are never sent to the gateway."""
+        client = MagicMock()
+        client.put_devices_data = AsyncMock()
+        device = TydomShutter(
+            client,
+            "10_20",
+            "20",
+            "Cover",
+            "shutter",
+            "10",
+            {
+                "positionCmd": {
+                    "permission": "r",
+                    "enum_values": ["FAVORIT1", "FAVORIT2"],
+                }
+            },
+            {"position": 50},
+        )
+
+        self.assertEqual(device.favourite_commands, frozenset())
+        with self.assertRaisesRegex(ValueError, "does not support favourite position"):
+            await device.recall_favourite_position(1)
+        with self.assertRaisesRegex(ValueError, "does not support favourite position"):
+            await device.recall_favourite_position(3)
+        client.put_devices_data.assert_not_awaited()
+
 
 if __name__ == "__main__":
     import unittest

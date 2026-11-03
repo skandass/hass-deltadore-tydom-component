@@ -22,9 +22,10 @@ from custom_components.deltadore_tydom.hub import (
 )
 from custom_components.deltadore_tydom.hub import Hub
 from custom_components.deltadore_tydom.ha_entities import (
+    HACoverFavouriteButton,
+    HADeviceRemovalButton,
     HAGatewayAssociationGuideButton,
     HAGatewayAssociationNameText,
-    HADeviceRemovalButton,
 )
 from custom_components.deltadore_tydom.official_association_tutorials import (
     OFFICIAL_ASSOCIATION_TUTORIALS,
@@ -45,6 +46,7 @@ from custom_components.deltadore_tydom.tydom.tydom_devices import (
     TydomDevice,
     TydomRemoteControl,
     TydomScene,
+    TydomShutter,
 )
 
 
@@ -158,6 +160,62 @@ class GatewayAssociationTests(IsolatedAsyncioTestCase):
         self.assertEqual(recipe.usage, "sensorSun")
         self.assertEqual(recipe.picto, "picto_sensor6")
 
+    def test_tywell_control_uses_its_official_re2020_recipe(self) -> None:
+        """Tywell Control is not interchangeable with a Tywell 2050."""
+        recipe = get_standalone_association_recipe("Thermique", "Tywell Control")
+
+        self.assertIsNotNone(recipe)
+        self.assertEqual(recipe.usage, "re2020ControlBoiler")
+        self.assertEqual(recipe.first_usage, "hvac")
+        self.assertEqual(recipe.widget_action, "shutterCmd")
+        self.assertEqual(
+            get_install_payload("official:thermic_X3D_x3d_pps"),
+            {"protocol": "X3D", "type": "x3d_pps", "profile": "controller"},
+        )
+        self.assertTrue(get_official_association_tutorial("Tywell Control"))
+
+    def test_tywell_control_uses_its_single_official_step_visual(self) -> None:
+        """Its one guide visual belongs to the one physical action."""
+        overview, steps, stepwise = get_association_illustration_layout(
+            "tywell_control"
+        )
+
+        self.assertIsNone(overview)
+        self.assertEqual(steps, ("catalog_tywell_control_step1",))
+        self.assertTrue(stepwise)
+        illustration = get_association_illustration_svg("catalog_tywell_control_step1")
+        self.assertIsNotNone(illustration)
+        self.assertIn("#354254", illustration)
+
+    def test_tywell_control_guide_orders_device_then_gateway_actions(self) -> None:
+        """The Android app's combined instruction is explicit in HA."""
+        tydom_hub = object.__new__(Hub)
+        tydom_hub._association_controls = []
+        tydom_hub._association_category = "Thermique"
+        tydom_hub._association_product = "Tywell Control"
+        tydom_hub._association_profile = "official:thermic_X3D_x3d_pps"
+
+        self.assertEqual(
+            tydom_hub.association_instructions,
+            (
+                "1. Sur le Tywell Control, lancez « Association avec la box Tywell ».",
+                "2. Dans Home Assistant, cliquez sur « Lancer l'écoute de la passerelle » ci-dessous.",
+                "3. Attendez la découverte et l'ajout automatique du contrôleur.",
+            ),
+        )
+        self.assertEqual(tydom_hub.association_illustration_step_indexes, (0,))
+        self.assertEqual(tydom_hub.association_gateway_listening_step_indexes, (1,))
+
+    def test_atlantic_guide_marks_its_gateway_listening_step(self) -> None:
+        """The guide button is placed by the catalogue action marker."""
+        tydom_hub = object.__new__(Hub)
+        tydom_hub._association_controls = []
+        tydom_hub._association_category = "Thermique"
+        tydom_hub._association_product = "ATLANTIC"
+        tydom_hub._association_profile = "official:thermic_X3D_x3d_rm"
+
+        self.assertEqual(tydom_hub.association_gateway_listening_step_indexes, (1,))
+
     async def test_raw_standalone_product_is_promoted_to_gate_configuration(
         self,
     ) -> None:
@@ -223,6 +281,48 @@ class GatewayAssociationTests(IsolatedAsyncioTestCase):
         self.assertEqual(len(posted["endpoints"]), 1)
         self.assertEqual(posted["endpoints"][0]["name"], "Portillon")
         self.assertEqual(posted["endpoints"][0]["last_usage"], "gate")
+
+    async def test_tywell_control_is_written_with_its_re2020_configuration(
+        self,
+    ) -> None:
+        """A paired Tywell Control remains a controller in the TYDOM app."""
+        client = SimpleNamespace(
+            get_config_file_document=AsyncMock(return_value={"endpoints": []}),
+            post_config_file_document=AsyncMock(),
+        )
+        device = SimpleNamespace(
+            _id=1789330301,
+            _endpoint=1789330301,
+            _tydom_client=client,
+        )
+        recipe = get_standalone_association_recipe("Thermique", "Tywell Control")
+
+        name = await configure_standalone_product(
+            device, recipe, "tywell_control", "Tywell Control étage"
+        )
+
+        self.assertEqual(name, "Tywell Control étage")
+        posted = client.post_config_file_document.await_args.args[0]
+        self.assertEqual(
+            posted["endpoints"],
+            [
+                {
+                    "id_device": 1789330301,
+                    "id_endpoint": 1789330301,
+                    "name": "Tywell Control étage",
+                    "picto": "",
+                    "first_usage": "hvac",
+                    "last_usage": "re2020ControlBoiler",
+                    "anticipation_start": False,
+                    "skill": "TYDOM_X3D",
+                    "space_id": "",
+                    "widget_behavior": {
+                        "tutorial_id": "tywell_control",
+                        "action": "shutterCmd",
+                    },
+                }
+            ],
+        )
 
     async def test_tysense_sun_repairs_previous_generic_sensor_entry(self) -> None:
         """The previously created generic entry can be fixed without re-pairing."""
@@ -780,6 +880,26 @@ class GatewayAssociationTests(IsolatedAsyncioTestCase):
         self.assertIn("Tysense Thermo", tydom_hub.association_product_labels)
         self.assertTrue(tydom_hub.association_product_supported)
 
+    def test_tywell_control_requires_a_tywell_gateway(self) -> None:
+        """Do not offer the RE2020 controller to standard TYDOM gateways."""
+        tydom_hub = object.__new__(Hub)
+        tydom_hub._association_controls = []
+        tydom_hub._association_category = "Thermique"
+        tydom_hub._association_product = "Tywell Control"
+        tydom_hub._association_profile = "official:thermic_X3D_x3d_pps"
+        tydom_hub._id = "gateway"
+        tydom_hub.devices = {
+            "gateway": SimpleNamespace(productName="TYDOM PRO"),
+        }
+
+        self.assertNotIn("Tywell Control", tydom_hub.association_product_labels)
+        self.assertFalse(tydom_hub.association_product_supported)
+
+        tydom_hub.devices["gateway"].productName = "TYWELL PRO"
+
+        self.assertIn("Tywell Control", tydom_hub.association_product_labels)
+        self.assertTrue(tydom_hub.association_product_supported)
+
     def test_official_products_hide_ambiguous_generic_recipes(self) -> None:
         """Known hardware must not be mixed with raw radio-profile choices."""
         self.assertEqual(
@@ -847,8 +967,8 @@ class GatewayAssociationTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(corrupted_steps, [])
         self.assertIn(
-            "À l'aide de la télécommande.",
-            OFFICIAL_ASSOCIATION_TUTORIALS["TUBAUTO Procom 10-3"][0].text,
+            "à l'aide de la télécommande.",
+            OFFICIAL_ASSOCIATION_TUTORIALS["TUBAUTO Procom 10-3"][0].text.lower(),
         )
 
     def test_association_instructions_unescape_catalogue_quotes(self) -> None:
@@ -1190,7 +1310,8 @@ class GatewayAssociationTests(IsolatedAsyncioTestCase):
         )
 
         button = HADeviceRemovalButton(device, None)
-        self.assertEqual(button._attr_name, "Dissocier le bouton 1")
+        self.assertEqual(button.translation_key, "remove_numbered_button")
+        self.assertEqual(button.translation_placeholders, {"button_number": "1"})
 
     async def test_button_removal_uses_group_siblings_and_drops_empty_member(
         self,
@@ -1843,3 +1964,66 @@ class GatewayAssociationTests(IsolatedAsyncioTestCase):
         tydom_hub._maybe_create_device_association_buttons(object.__new__(TydomScene))
 
         tydom_hub.add_button_callback.assert_not_called()
+
+
+class CoverFavouriteButtonTests(IsolatedAsyncioTestCase):
+    """Expose only favourite slots advertised by a cover endpoint."""
+
+    def _hub(self) -> Hub:
+        hub = object.__new__(Hub)
+        hub._hass = None
+        hub.add_button_callback = MagicMock()
+        hub._cover_favourite_buttons_created = set()
+        return hub
+
+    def _shutter(self, enum_values: list[str]) -> TydomShutter:
+        return TydomShutter(
+            MagicMock(),
+            "10_20",
+            "20",
+            "Cover",
+            "shutter",
+            "10",
+            {
+                "positionCmd": {
+                    "permission": "w",
+                    "enum_values": enum_values,
+                }
+            },
+            {"position": 50},
+        )
+
+    async def test_creates_one_button_per_advertised_favourite(self) -> None:
+        """A gateway with both slots gets two stable controls once."""
+        hub = self._hub()
+        device = self._shutter(["DOWN", "UP", "FAVORIT1", "FAVORIT2"])
+
+        hub._maybe_create_cover_favourite_buttons(device)
+        hub._maybe_create_cover_favourite_buttons(device)
+
+        hub.add_button_callback.assert_called_once()
+        buttons = hub.add_button_callback.call_args.args[0]
+        self.assertEqual(len(buttons), 2)
+        self.assertTrue(
+            all(isinstance(button, HACoverFavouriteButton) for button in buttons)
+        )
+        self.assertEqual(
+            [button._favourite_number for button in buttons],
+            [1, 2],
+        )
+        self.assertEqual(
+            [button.unique_id for button in buttons],
+            [
+                "10_20_button_favourite_position_1",
+                "10_20_button_favourite_position_2",
+            ],
+        )
+
+    async def test_does_not_create_button_for_unadvertised_slot(self) -> None:
+        """No favourite controls appear when the endpoint lacks the values."""
+        hub = self._hub()
+        device = self._shutter(["DOWN", "UP", "STOP"])
+
+        hub._maybe_create_cover_favourite_buttons(device)
+
+        hub.add_button_callback.assert_not_called()
