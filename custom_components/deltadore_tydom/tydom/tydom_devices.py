@@ -1178,17 +1178,33 @@ class TydomBoiler(TydomDevice):
         """Return a known general Off/Absence lock, without guessing from a model."""
         home = getattr(self._tydom_client, "general_climate", None)
         reason = getattr(home, "lock_reason", None)
+        if reason == "off" and self._is_independent_reversible_zone():
+            # Fork: independent reversible splits (e.g. Naviclim) restart the
+            # general mode themselves in set_hvac_mode(); an all-off aggregate
+            # must not lock them out of Home Assistant.
+            return None
         if isinstance(reason, str) and reason in ("off", "absence"):
             return reason
         if isinstance(getattr(home, "mode", None), str):
             return None
         # Before the general resource arrives, local-mode profiles advertise
         # the same seasonal stop through their authorization register.
-        if getattr(self, "authorization", None) == "STOP" and (
-            self.uses_area_local_mode or self._is_writable("localMode")
+        if (
+            getattr(self, "authorization", None) == "STOP"
+            and (self.uses_area_local_mode or self._is_writable("localMode"))
+            and not self._is_independent_reversible_zone()
         ):
             return "off"
         return None
+
+    def _is_independent_reversible_zone(self) -> bool:
+        """Return whether this is a standalone heat/cool zone (fork patch)."""
+        return (
+            not self.is_area_controlled
+            and not self.uses_area_local_mode
+            and self._uses_zone_authorization()
+            and hasattr(self, "coolSetpoint")
+        )
 
     def validate_general_hvac_mode(self) -> None:
         """Reject zone requests locked by the installation's general mode."""
